@@ -446,6 +446,14 @@ def vault_index(vault):
         source_dir = folder / 'source-data'
         if source_dir.exists():
             evidence.extend(p.read_text() for p in source_dir.glob('*.md') if p.stat().st_size < 2_000_000)
+        # Managed conversation records carry binding provenance only in frontmatter;
+        # quoted transcript text must not claim ownership of other conversations.
+        conversation_dir = folder / 'conversations'
+        if conversation_dir.exists():
+            for capture in conversation_dir.glob('chatgpt-*.md'):
+                header = capture.read_text().split('---', 2)
+                if len(header) == 3 and header[0] == '' and re.search(r'^type: chatgpt-conversation$', header[1], re.M):
+                    evidence.append(header[1])
         for body in evidence:
             for found in re.findall(r'^\s*(?:-\s*)?(?:backing_conversation_id|conversation_id|Backing conversation ID|Conversation ID):\s*[`\'\"]?([a-f0-9-]{36})', body, re.I | re.M):
                 if UUID.fullmatch(found):
