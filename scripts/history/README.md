@@ -31,7 +31,11 @@ Use `--archive /absolute/private/path` and `--descriptor /absolute/path/to/launc
 - Archive: `~/.local/share/chatgpt-conversation-archive`
 - DEV descriptor: `~/.local/share/codex-experiments/chatgpt-web/dev-profile/runtime/launcher-browser.json`
 
-Bound each run with `--max-pages` (default 5), `--page-size` (20), and `--max-conversations` (10). A truncated run exits 2 without advancing its checkpoint. Reruns reuse successful captures; increase the page bound if the recent window cannot be traversed. `--refresh-known` verifies overlapping known chats even if their update timestamps have not changed. `capture --id` can force a recheck outside the current scan window.
+A normal `sync` catches up on **all new or updated conversations since the last completed checkpoint**, fetching 20 conversations per batch and continuing with further batches. Creation date does not limit discovery: an old thread updated today is included. Use `--batch-size N` to change the batch size (`--max-conversations` remains an alias for that per-batch setting).
+
+Safety limits are `--max-batches` (default 25), `--max-pages` (100 pages of discovery depth per batch), and `--page-size` (20). Discovery depth grows as needed beyond the initial five pages. Reaching a limit returns `backlog_remaining: true` with `stop_reason: batch_limit` or `page_limit` and exits 2 without advancing the completed checkpoint. Reruns reuse successful captures; increase `--max-pages` if the window is deeper than its cap. A source failure also leaves the window pending. First-run and explicit-backfill boundaries survive process exit, so a later run cannot silently skip their remaining conversations.
+
+`--refresh-known` verifies each overlapping known chat once per run even if its update timestamp has not changed. `capture --id` can force a recheck outside the current scan window. Only changed revisions produce new transcripts; repeat discovery does not duplicate messages. Explicit backfill can update bookkeeping even when content is unchanged.
 
 ## Data and correctness
 
@@ -46,7 +50,7 @@ Bound each run with `--max-pages` (default 5), `--page-size` (20), and `--max-co
 
 ## Coverage
 
-Verified locally: regular saved chats, mobile-created chat discovery, continuation of an already captured chat, no-change repeat, and existing project ID matching. Access does not depend on visiting each chat in the browser. Older histories can be explicitly sampled.
+Verified locally: regular saved chats, mobile-created chat discovery, continuation of an already captured chat, discovery of an old thread updated after the checkpoint, multiple catch-up batches, no-change repeat, and existing project ID matching. Access does not depend on visiting each chat in the browser. Older histories can be explicitly sampled.
 
 Still limited: automatic discovery of chats visible only inside ChatGPT Projects or archived collections, exhaustive account history, edits that do not bump source update time outside the overlap, attachment binaries, and long-running operational reliability. Unit fixtures cover edits/branches; these were not live-edited in a personal conversation.
 

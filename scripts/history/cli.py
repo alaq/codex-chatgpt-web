@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from archive import Archive, private_dir, review, scan
+from archive import Archive, private_dir, review, catch_up
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -63,10 +63,11 @@ def main():
     parser.add_argument('--archive',default=str(Path.home()/'.local/share/chatgpt-conversation-archive'))
     parser.add_argument('--descriptor',default=str(Path.home()/'.local/share/codex-experiments/chatgpt-web/dev-profile/runtime/launcher-browser.json'))
     sub=parser.add_subparsers(dest='command',required=True)
-    s=sub.add_parser('sync',help='Collect new/changed saved chats; first run starts now unless --since is given')
+    s=sub.add_parser('sync',help='Catch up on all new/updated saved chats in batches; first run starts now unless --since is given')
     s.add_argument('--since',help='ISO timestamp with timezone; optional historical start')
-    s.add_argument('--max-pages',type=int,default=5)
-    s.add_argument('--max-conversations',type=int,default=10)
+    s.add_argument('--max-pages',type=int,default=100,help='Safety cap on discovery depth per batch')
+    s.add_argument('--batch-size','--max-conversations',dest='batch_size',type=int,default=20,help='Conversation fetches per batch (default 20); sync continues with further batches')
+    s.add_argument('--max-batches',type=int,default=25,help='Safety cap; unfinished catch-up retains its previous checkpoint')
     s.add_argument('--page-size',type=int,default=20)
     s.add_argument('--refresh-known',action='store_true',help='Refetch known overlapping chats even when update timestamps match')
     c=sub.add_parser('capture',help='Capture selected existing IDs without changing discovery checkpoint')
@@ -88,9 +89,7 @@ def main():
         archive=Archive(root)
         try:
             if args.command=='sync':
-                if not 1<=args.max_pages<=100 or not 1<=args.max_conversations<=100 or not 1<=args.page_size<=50:
-                    raise ValueError('Invalid collector bounds')
-                result=scan(archive,Client(args.descriptor),args.since,args.max_pages,args.max_conversations,args.page_size,args.refresh_known)
+                result=catch_up(archive,Client(args.descriptor),args.since,args.batch_size,args.max_batches,args.max_pages,args.page_size,args.refresh_known)
                 result['transcripts_written']=archive.render()
             elif args.command=='capture':
                 if len(args.id)>10:

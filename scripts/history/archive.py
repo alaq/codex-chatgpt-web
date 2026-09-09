@@ -245,14 +245,13 @@ class Archive:
         return writes
 
 
-def scan(archive, client, since, max_pages=5, max_conversations=10, page_size=20, refresh_known=False):
+def scan(archive, client, since, max_pages=5, max_conversations=10, page_size=20, refresh_known=False,
+         refreshed=None, observed_ids=None, processed_ids=None):
     """Scan updated order with overlap. Never advance checkpoint on truncation/failure."""
     saved = archive.meta('watermark')
     start = timestamp(since) if since else (float(saved) if saved else datetime.now(timezone.utc).timestamp())
     cutoff = start - (300 if saved and not since else 0)
-    if saved and since and timestamp(since) < float(saved):
-        # Explicit backfill is permitted but must never move the forward cursor backward.
-        pass
+    refreshed = {} if refreshed is None else refreshed
     seen, pages, captured, unchanged, errors = set(), 0, [], 0, []
     exhausted = False
     newest = float(saved) if saved else start
@@ -286,9 +285,13 @@ def scan(archive, client, since, max_pages=5, max_conversations=10, page_size=20
             seen.add(cid)
             if item.get('is_temporary_chat'):
                 continue
+            if observed_ids is not None:
+                observed_ids.add(cid)
             old = archive.current(cid)
-            if old and old['source_update'] >= updated and not refresh_known:
+            if old and old['source_update'] >= updated and (not refresh_known or refreshed.get(cid, float('-inf')) >= updated):
                 unchanged += 1
+                if processed_ids is not None:
+                    processed_ids.add(cid)
                 newest = max(newest, updated)
                 continue
             if requests >= max_conversations:
@@ -302,7 +305,12 @@ def scan(archive, client, since, max_pages=5, max_conversations=10, page_size=20
                 body = json.loads(response['raw'])
                 if (body.get('conversation_id') or body.get('id')) != cid:
                     raise ValueError('Fetched conversation ID mismatch')
+                if timestamp(body.get('update_time')) < updated:
+                    raise ValueError('Fetched conversation is older than its history entry; retry')
                 result = archive.ingest(response)
+                refreshed[cid] = updated
+                if processed_ids is not None:
+                    processed_ids.add(cid)
                 if result['changed']:
                     captured.append(result)
                 else:
@@ -326,6 +334,65 @@ def scan(archive, client, since, max_pages=5, max_conversations=10, page_size=20
             'captured': captured, 'unchanged': unchanged, 'errors': errors,
             'checkpoint_advanced': complete and archive.meta('watermark') != saved,
             'cutoff': iso(cutoff), 'coverage': 'updated regular history endpoint; project/archived-only discovery unverified'}
+
+
+def catch_up(archive, client, since=None, batch_size=20, max_batches=25, max_pages=100,
+             page_size=20, refresh_known=False):
+    """Drain a fixed update window in bounded batches, advancing only on completion.
+
+    Revisit the list head between batches because old conversations can move forward.
+    Successfully stored versions are the restart checkpoint; offsets are not durable.
+    """
+    if not 1 <= batch_size <= 100 or not 1 <= max_batches <= 100 or not 1 <= max_pages <= 100 or not 1 <= page_size <= 50:
+        raise ValueError('Invalid catch-up bounds')
+    original = archive.meta('watermark')
+    start = timestamp(since) if since else (float(original) if original else datetime.now(timezone.utc).timestamp())
+    cutoff = start - (300 if original and not since else 0)
+    pending = archive.meta('pending_cutoff')
+    if pending is not None:
+        cutoff = min(cutoff, float(pending))
+    # Ordinary retries can recover from the completed watermark. A first run or
+    # explicit backfill also needs its older boundary to survive process exit.
+    if original is None or since is not None or pending is not None:
+        archive.set_meta('pending_cutoff', str(cutoff))
+    window_since = iso(cutoff)
+    refreshed, observed, processed, captured = {}, set(), set(), []
+    page_limit = min(5, max_pages)
+    pages = fetched = 0
+    complete, stop_reason, errors = False, 'batch_limit', []
+    for batch in range(1, max_batches + 1):
+        result = scan(archive, client, window_since, page_limit, batch_size, page_size,
+                      refresh_known, refreshed, observed, processed)
+        pages += result['pages']
+        fetched += result['fetched']
+        captured.extend(result['captured'])
+        if result['complete_window']:
+            complete, stop_reason = True, 'caught_up'
+            break
+        errors = [e for e in result['errors'] if e['error'] != 'conversation request budget reached']
+        if errors:
+            stop_reason = 'source_error'
+            break
+        if not result['errors']:
+            if page_limit >= max_pages:
+                stop_reason = 'page_limit'
+                break
+            page_limit = min(max_pages, page_limit * 2)
+    if complete and archive.meta('pending_cutoff') is not None:
+        with archive.db:
+            archive.db.execute("DELETE FROM meta WHERE key='pending_cutoff'")
+    changed_ids = {r['id'] for r in captured}
+    return {'complete_window': complete, 'backlog_remaining': not complete,
+            'stop_reason': stop_reason, 'batches': batch, 'batch_size': batch_size,
+            'pages': pages, 'discovered': len(observed), 'fetched': fetched,
+            'captured': captured, 'changed_conversations': len(changed_ids),
+            'unchanged': len(processed - changed_ids),
+            'pending_observed': len(observed - processed), 'errors': errors,
+            'checkpoint_before': iso(float(original)) if original else None,
+            'checkpoint_after': iso(float(archive.meta('watermark'))) if archive.meta('watermark') else None,
+            'checkpoint_advanced': archive.meta('watermark') != original,
+            'cutoff': window_since,
+            'coverage': 'updated regular history endpoint; project/archived-only discovery unverified'}
 
 
 STOP = set('a an the and or in on at to for of with from is are it this that my your i me we you how can would what do does should about use using into have be as by all but not just then than already also could has had will want which there their our get got let new one some any such more really much yes no give add com https http www github'.split())

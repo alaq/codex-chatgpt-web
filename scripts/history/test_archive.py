@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from archive import Archive, digest, normalize, scan, review, vault_index
+from archive import Archive, digest, normalize, scan, catch_up, review, vault_index
 
 ID='11111111-1111-1111-1111-111111111111'
 ID2='22222222-2222-2222-2222-222222222222'
@@ -144,5 +144,126 @@ class ArchiveTests(unittest.TestCase):
         for value in [None, 'u']:
             data=conversation();data['mapping']['a']['message']['id']=value
             with self.assertRaisesRegex(ValueError,'message ID'):self.archive.ingest(envelope(data))
+
+class CatchUpTests(unittest.TestCase):
+    setUp = ArchiveTests.setUp
+    tearDown = ArchiveTests.tearDown
+    def fixture(self, count=7):
+        data = {}
+        for i in range(count):
+            cid = f'{i+1:08d}-1111-1111-1111-111111111111'
+            conv = conversation()
+            conv.update(conversation_id=cid, create_time=100, update_time=2000-i)
+            data[cid] = conv
+        calls = []
+        def client(req):
+            calls.append(req)
+            if req['operation'] == 'list':
+                items = [{'id':cid, 'update_time':conv['update_time']} for cid,conv in data.items()]
+                items = items[req['offset']:req['offset']+req['limit']]
+                return envelope({'items':items, 'offset':req['offset'], 'total':req['offset']+len(items)+1})
+            return envelope(data[req['id']])
+        return client, calls, data
+
+    def test_old_created_recently_updated_drains_multiple_batches(self):
+        self.archive.set_meta('watermark', '1500.0')
+        client, calls, data = self.fixture()
+        result = catch_up(self.archive, client, batch_size=2)
+        self.assertTrue(result['complete_window'])
+        self.assertEqual((result['batches'], result['fetched'], result['changed_conversations']), (4, 7, 7))
+        self.assertEqual(result['pending_observed'], 0)
+        self.assertEqual(len(self.archive.all()), 7)
+        self.assertEqual(self.archive.meta('watermark'), '2000.0')
+        self.archive.render()
+        before = fingerprint(self.root)
+        repeat = catch_up(self.archive, client)
+        self.assertEqual(repeat['fetched'], 0)
+        self.assertEqual(self.archive.render(), 0)
+        self.assertEqual(before, fingerprint(self.root))
+
+    def test_batch_limit_preserves_checkpoint_and_resumes(self):
+        self.archive.set_meta('watermark', '1500.0')
+        client, calls, data = self.fixture(5)
+        first = catch_up(self.archive, client, batch_size=2, max_batches=1)
+        self.assertTrue(first['backlog_remaining'])
+        self.assertEqual(first['stop_reason'], 'batch_limit')
+        self.assertEqual(first['unchanged'], 0)
+        self.assertEqual(first['pending_observed'], 1)
+        self.assertEqual(self.archive.meta('watermark'), '1500.0')
+        second = catch_up(self.archive, client, batch_size=2)
+        self.assertTrue(second['complete_window'])
+        self.assertEqual(second['fetched'], 3)
+        self.assertEqual(len([r for r in calls if r['operation']=='conversation']), 5)
+
+    def test_discovery_expands_beyond_initial_five_pages(self):
+        client, calls, data = self.fixture(7)
+        result = catch_up(self.archive, client, '1970-01-01T00:25:00Z', page_size=1, max_pages=10)
+        self.assertTrue(result['complete_window'])
+        self.assertEqual((result['batches'], result['fetched']), (2, 7))
+        self.assertTrue(any(r.get('offset') == 7 for r in calls))
+
+    def test_page_safety_limit_remains_incomplete(self):
+        self.archive.set_meta('watermark', '1500.0')
+        client, calls, data = self.fixture(7)
+        result = catch_up(self.archive, client, page_size=1, max_pages=5)
+        self.assertEqual(result['stop_reason'], 'page_limit')
+        self.assertFalse(result['complete_window'])
+        self.assertEqual(self.archive.meta('watermark'), '1500.0')
+
+    def test_refresh_once_per_conversation_across_batches(self):
+        client, calls, data = self.fixture(5)
+        catch_up(self.archive, client, '1970-01-01T00:25:00Z')
+        calls.clear()
+        result = catch_up(self.archive, client, batch_size=1, refresh_known=True)
+        self.assertTrue(result['complete_window'])
+        self.assertEqual((result['batches'], result['fetched'], result['unchanged']), (5, 5, 5))
+        self.assertEqual(len({r['id'] for r in calls if r['operation']=='conversation'}), 5)
+
+    def test_first_run_cutoff_survives_process_restart(self):
+        from unittest.mock import patch
+        from datetime import datetime, timezone
+        client, calls, data = self.fixture(3)
+        with patch('archive.datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime.fromtimestamp(1500, timezone.utc)
+            first = catch_up(self.archive, client, batch_size=1, max_batches=1)
+        self.assertFalse(first['complete_window'])
+        self.assertIsNone(self.archive.meta('watermark'))
+        self.archive.close()
+        self.archive = Archive(self.root)
+        with patch('archive.datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime.fromtimestamp(5000, timezone.utc)
+            second = catch_up(self.archive, client)
+        self.assertTrue(second['complete_window'])
+        self.assertEqual(second['fetched'], 2)
+        self.assertIsNone(self.archive.meta('pending_cutoff'))
+
+    def test_interrupted_backfill_keeps_older_boundary(self):
+        self.archive.set_meta('watermark', '5000.0')
+        client, calls, data = self.fixture(3)
+        first = catch_up(self.archive, client, '1970-01-01T00:25:00Z', batch_size=1, max_batches=1)
+        self.assertFalse(first['complete_window'])
+        second = catch_up(self.archive, client)
+        self.assertTrue(second['complete_window'])
+        self.assertEqual(second['fetched'], 2)
+        self.assertEqual(self.archive.meta('watermark'), '5000.0')
+
+    def test_source_failure_and_stale_response_leave_work_pending(self):
+        for failure in ('error', 'stale'):
+            with self.subTest(failure=failure):
+                self.archive.set_meta('watermark', '1500.0')
+                client, calls, data = self.fixture(1)
+                def failing(req):
+                    if req['operation']=='conversation':
+                        if failure == 'error':
+                            raise RuntimeError('retrieval failed')
+                        stale = copy.deepcopy(data[req['id']]); stale['update_time'] -= 1
+                        return envelope(stale)
+                    return client(req)
+                result = catch_up(self.archive, failing)
+                self.assertEqual(result['stop_reason'], 'source_error')
+                self.assertEqual(result['batches'], 1)
+                self.assertTrue(result['backlog_remaining'])
+                self.assertEqual(self.archive.meta('watermark'), '1500.0')
+                self.assertEqual(self.archive.all(), [])
 
 if __name__=='__main__':unittest.main()
