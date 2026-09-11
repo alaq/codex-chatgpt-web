@@ -30,7 +30,8 @@ def main():
             code = ''
         allowed = {'saved_send_uncertain', 'saved_send_busy', 'saved_send_source_busy', 'saved_send_source_changed',
                    'saved_send_disabled', 'saved_send_account_mismatch', 'saved_send_transaction_conflict',
-                   'saved_send_composer_unavailable', 'saved_send_draft_mismatch', 'saved_send_wrong_page'}
+                   'saved_send_composer_unavailable', 'saved_send_draft_mismatch', 'saved_send_wrong_page',
+                   'saved_send_existing_draft', 'saved_send_challenge', 'saved_send_login_required'}
         result = {'version': 1, 'status': 'uncertain' if code not in allowed or code == 'saved_send_uncertain' else 'not_sent',
                   'error': code if code in allowed else 'saved_send_failed'}
     except (urllib.error.URLError, TimeoutError):

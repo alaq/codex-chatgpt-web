@@ -65,6 +65,26 @@ function checkIdle(data) {
   if (m && (m.status === "in_progress" || m.status === "pending" || m.metadata?.is_complete === false || m.author?.role === "user")) throw fail("saved_send_source_busy");
 }
 
+// Layout-derived innerText inserts extra blank lines between editor paragraphs.
+// Read actual paragraph/line-break structure instead, preserving intentional blank
+// lines and inline text. This function is also evaluated inside the saved page.
+function readComposerText(editor) {
+  if (!editor) return "";
+  if (editor.tagName === "TEXTAREA" || editor.tagName === "INPUT") return editor.value;
+  const text = node => {
+    if (node.nodeType === 3) return node.textContent || "";
+    if (node.tagName === "BR") return "\n";
+    const children = Array.from(node.childNodes || []);
+    if (children.length === 1 && children[0].tagName === "BR") return "";
+    return children.map(text).join("");
+  };
+  const children = Array.from(editor.childNodes || []);
+  return children.map((child, index) => {
+    const boundary = index > 0 && (['P', 'DIV'].includes(child.tagName) || ['P', 'DIV'].includes(children[index - 1].tagName));
+    return (boundary ? "\n" : "") + text(child);
+  }).join("");
+}
+
 class SavedSender {
   constructor({ directory, readHistory, openConversation, wait = delay, attempts = 20 }) {
     Object.assign(this, { directory, readHistory, openConversation, wait, attempts });
@@ -111,7 +131,7 @@ class SavedSender {
       if (active) settle(active); // An unresolved prior attempt blocks new sends to this chat.
       checkIdle(data);
       const parentId = data.current_node;
-      ui = await this.openConversation(request.conversationId);
+      ui = await this.openConversation(request.conversationId, request.text);
       await ui.prepare(request.text);
       data = checkedHistory(await this.readHistory(request.conversationId), request);
       checkIdle(data);
@@ -139,7 +159,7 @@ class SavedSender {
   }
 }
 
-async function openSavedConversation(host, id) {
+async function openSavedConversation(host, id, expectedText) {
   const { BrowserWindow } = require("electron");
   const url = `https://chatgpt.com/c/${id}`;
   const win = new BrowserWindow({ show: false, width: 1000, height: 900, webPreferences: {
@@ -152,7 +172,7 @@ async function openSavedConversation(host, id) {
     const editor = document.querySelector('#prompt-textarea');
     const stop = document.querySelector('[data-testid="stop-button"]');
     return {ready: !!editor && (editor.isContentEditable || editor.tagName === 'TEXTAREA') && !stop,
-      text: editor ? (editor.value ?? editor.innerText) : ''};
+      text: (${readComposerText.toString()})(editor)};
   })()`;
   try {
     await contents.loadURL(url);
@@ -160,16 +180,52 @@ async function openSavedConversation(host, id) {
     for (let i = 0; i < 100; i++) {
       if (contents.getURL() !== url) throw fail("saved_send_wrong_page");
       const state = await contents.executeJavaScript(inspect);
-      if (state.ready) { if (state.text.trim()) throw fail("saved_send_existing_draft"); ready = true; break; }
+      if (state.ready) {
+        // A rejected pre-submit attempt can leave its exact draft in ChatGPT.
+        // Reuse only that same requested text; never erase an unrelated draft.
+        if (state.text.trim() && state.text.trim() !== expectedText.trim()) throw fail("saved_send_existing_draft");
+        ready = true; break;
+      }
       await delay(300);
     }
     if (!ready) throw fail("saved_send_composer_unavailable");
-  } catch { win.destroy(); throw fail("saved_send_composer_unavailable"); }
+  } catch (error) {
+    // Log structural diagnostics only: never draft text, cookies, or page HTML.
+    let diagnostic = {};
+    try {
+      diagnostic = await contents.executeJavaScript(`(() => {
+        const body = (document.body?.innerText || '').toLowerCase();
+        return {urlMatches: location.href === ${JSON.stringify(url)}, readyState: document.readyState,
+          composerCount: document.querySelectorAll('#prompt-textarea, [data-testid="prompt-textarea"]').length,
+          editableCount: document.querySelectorAll('[contenteditable="true"],textarea').length,
+          challenge: !!document.querySelector('#challenge-running, #challenge-stage') || body.includes('verify you are human'),
+          loginRequired: !!document.querySelector('[data-testid="login-button"]'),
+          rateLimited: body.includes('too many requests') || body.includes('rate limit')};
+      })()`);
+    } catch { /* renderer may be gone */ }
+    host.logger?.warn('saved_send.composer_unavailable', diagnostic);
+    win.destroy();
+    throw fail(error.code === "saved_send_existing_draft" ? error.code : diagnostic.challenge ? 'saved_send_challenge' : diagnostic.loginRequired ? 'saved_send_login_required' : "saved_send_composer_unavailable");
+  }
   return {
     async prepare(text) {
       if (contents.getURL() !== url) throw fail("saved_send_wrong_page");
-      await contents.executeJavaScript(`document.querySelector('#prompt-textarea').focus()`);
-      await contents.insertText(text);
+      const initial = await contents.executeJavaScript(inspect);
+      if (initial.ready && initial.text.trim() === text.trim()) return;
+      if (initial.text.trim()) throw fail("saved_send_existing_draft");
+      // Match the main adapter's plain-text editing command. insertText is treated
+      // as typing by Lexical and can activate Markdown shortcuts or alter newlines.
+      const inserted = await contents.executeJavaScript(`(() => {
+        const editor = document.querySelector('#prompt-textarea');
+        editor.focus();
+        if (document.activeElement !== editor) return false;
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editor); range.collapse(false);
+        selection.removeAllRanges(); selection.addRange(range);
+        return document.execCommand('insertText', false, ${JSON.stringify(text)});
+      })()`);
+      if (!inserted) throw fail("saved_send_draft_mismatch");
       for (let i = 0; i < 40; i++) {
         const state = await contents.executeJavaScript(inspect);
         if (state.ready && state.text.trim() === text.trim()) return;
@@ -182,7 +238,7 @@ async function openSavedConversation(host, id) {
         if (location.href !== ${JSON.stringify(url)}) return false;
         const editor = document.querySelector('#prompt-textarea');
         const button = document.querySelector('button[data-testid="send-button"]');
-        if (!editor || (editor.value ?? editor.innerText).trim() !== ${JSON.stringify(text.trim())} || !button || button.disabled) return false;
+        if (!editor || (${readComposerText.toString()})(editor).trim() !== ${JSON.stringify(text.trim())} || !button || button.disabled) return false;
         button.click(); return true;
       })()`);
       if (!result) throw fail("saved_send_submit_unavailable");
@@ -207,9 +263,9 @@ async function sendSavedConversation(host, request) {
   validateRequest(request);
   sender ??= new SavedSender({ directory: process.env.CODEX_WEB_GPT_SAVED_SEND_DIR,
     readHistory: id => readSavedHistory(host, { operation: "conversation", id }),
-    openConversation: id => openSavedConversation(host, id) });
+    openConversation: (id, text) => openSavedConversation(host, id, text) });
   try { return await host.withManualOperation("saved conversation send", () => sender.send(request)); }
   catch (e) { throw fail(/^saved_send_[a-z_]+$/.test(e?.code || "") ? e.code : "saved_send_failed"); }
 }
 
-module.exports = { SavedSender, validateRequest, acknowledgedMessage, sendSavedConversation };
+module.exports = { SavedSender, validateRequest, acknowledgedMessage, sendSavedConversation, readComposerText };

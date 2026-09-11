@@ -82,3 +82,28 @@ test("private state rejects symlinks and persists no prompt text", async t => {
   fs.renameSync(file, file + ".original"); fs.symlinkSync(file + ".original", file);
   await assert.rejects(f.sender.send(request), /unsafe_record/);
 });
+
+test("composer readback preserves multiline drafts without layout blank lines", () => {
+  const { readComposerText } = require('../electron/saved-send.cjs');
+  const text = value => ({nodeType:3,textContent:value});
+  const el = (tagName,...childNodes) => ({nodeType:1,tagName,childNodes});
+  const editor = el('DIV', el('P',text('First line')),el('P',text('Second line')));
+  editor.innerText = 'First line\n\nSecond line';
+  assert.equal(readComposerText(editor),'First line\nSecond line');
+  assert.equal(readComposerText(el('DIV',el('P',text('First')),el('P',el('BR')),el('P',text('Third')))), 'First\n\nThird');
+  assert.equal(readComposerText(el('DIV',el('P',text('A'),el('BR'),text('B')))), 'A\nB');
+  assert.equal(readComposerText(el('DIV',el('P',text('**literal**  '),el('SPAN',text('code'))))), '**literal**  code');
+  assert.equal(readComposerText({tagName:'TEXTAREA',value:'A\n\nB'}),'A\n\nB');
+});
+
+test("multiline saved request is acknowledged exactly and replayed without duplication", async t => {
+  const f=fixture(t);
+  const multiline={...request,text:'First line\nSecond line\n\n**literal markdown**'};
+  f.submit(() => {
+    f.data.mapping[userId]={parent:'head',message:{id:userId,author:{role:'user'},content:{content_type:'text',parts:[multiline.text]}}};
+    f.data.current_node=userId;
+  });
+  assert.equal((await f.sender.send(multiline)).userMessageId,userId);
+  assert.equal((await new SavedSender(f.opts).send(multiline)).replayed,true);
+  assert.equal(f.clicks(),1);
+});
