@@ -36,8 +36,10 @@ reads one JSON object from stdin. Prompts and credentials must not appear in arg
 Text must be non-empty and no larger than 12,000 UTF-8 bytes. Multiline drafts
 use semantic paragraph/line-break readback instead of layout-derived `innerText`,
 and plain-text insertion avoids editor Markdown shortcuts. Native editing temporarily
-uses `white-space: pre-wrap` to preserve ordinary spaces before line breaks, rather
-than allowing Chromium to rewrite them as nonbreaking spaces. An exact existing draft
+uses `white-space: pre-wrap` on the editor and its existing descendants to preserve
+ordinary spaces before line breaks. The empty ChatGPT placeholder paragraph has its
+own `nowrap` rule, so changing the outer editor alone is insufficient. Original inline
+styles are restored after editing. An exact existing draft
 can be reused; a draft differing only by that browser-created substitution is repaired
 and checked again before submission. Other draft differences block sending. The response has
 `version: 1` and a status of `accepted`, `not_sent`, or `uncertain`. An accepted
@@ -62,6 +64,9 @@ their own durable association and authorization.
 
 Validation: sender tests plus the unchanged launcher ownership/control tests;
 `cd launcher && npm run test:saved-editor` exercises native Chromium insertion and
-draft repair in an isolated, offline profile, including spaces before newlines.
+draft repair in an isolated, offline profile, including ChatGPT's nested `nowrap`
+placeholder and spaces before newlines. The placeholder regression fails against
+the earlier outer-editor-only implementation. Fresh insertion of the original
+multiline request was also verified in the live ChatGPT composer.
 live source acceptance, idempotent replay, and a Matrix-originated continuation of
 the same saved conversation were verified on September 11, 2026.

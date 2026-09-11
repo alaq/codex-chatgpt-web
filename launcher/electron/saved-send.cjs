@@ -99,10 +99,15 @@ function repairableComposerDraft(actual, expected) {
 function insertComposerText(editor, text) {
   editor.focus();
   if (document.activeElement !== editor) return false;
-  const value = editor.style.getPropertyValue('white-space');
-  const priority = editor.style.getPropertyPriority('white-space');
+  // ChatGPT's empty placeholder paragraph has its own white-space: nowrap.
+  // Changing only the outer editor leaves native insertion inside that paragraph
+  // collapsible. Include descendants that can contain the selection/caret.
+  const styles = [editor, ...editor.querySelectorAll('*')].map(element => ({
+    element, value: element.style.getPropertyValue('white-space'),
+    priority: element.style.getPropertyPriority('white-space'),
+  }));
   try {
-    editor.style.setProperty('white-space', 'pre-wrap', 'important');
+    for (const {element} of styles) element.style.setProperty('white-space', 'pre-wrap', 'important');
     if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
       editor.setSelectionRange(0, editor.value.length);
     } else {
@@ -112,8 +117,10 @@ function insertComposerText(editor, text) {
     }
     return document.execCommand('insertText', false, text);
   } finally {
-    if (value) editor.style.setProperty('white-space', value, priority);
-    else editor.style.removeProperty('white-space');
+    for (const {element, value, priority} of styles) {
+      if (value) element.style.setProperty('white-space', value, priority);
+      else element.style.removeProperty('white-space');
+    }
   }
 }
 

@@ -11,14 +11,16 @@ app.whenReady().then(async () => {
   let win;
   try {
     win = new BrowserWindow({show: false, webPreferences: {sandbox: true, contextIsolation: true}});
-    await win.loadURL('data:text/html,<div id="editor" contenteditable="true"></div>');
+    await win.loadURL('data:text/html,' + encodeURIComponent('<style>#editor {white-space:break-spaces} #editor p {white-space:pre-wrap} #editor p.placeholder {white-space:nowrap}</style><div id="editor" contenteditable="true"></div>'));
     const cases = ['First line  \nSecond line', '  leading  and  repeated spaces\n\nLast',
-      'A\tB', 'A\u00a0B', '**literal**\n- list\n<tags> & emoji 🎉', 'Last line  '];
+      'A\tB', 'A\u00a0B', '**literal**\n- list\n<tags> & emoji 🎉', 'Last line  ',
+      'First paragraph with trailing spaces  \nSecond paragraph with trailing spaces  \nThird paragraph'];
     for (const text of cases) {
       for (const style of ['', 'white-space: normal !important', 'white-space: pre-wrap']) {
         const result = await win.webContents.executeJavaScript(`(() => {
           const e = document.querySelector('#editor');
-          e.innerHTML = '<p><br></p>'; e.setAttribute('style', ${JSON.stringify(style)});
+          e.innerHTML = '<p dir="auto" data-empty-paragraph="true" class="placeholder"><br class="ProseMirror-trailingBreak"></p>';
+          e.setAttribute('style', ${JSON.stringify(style)});
           const before = [e.style.getPropertyValue('white-space'), e.style.getPropertyPriority('white-space')];
           const inserted = (${insertComposerText.toString()})(e, ${JSON.stringify(text)});
           return {inserted, text: (${readComposerText.toString()})(e), before,
@@ -36,7 +38,7 @@ app.whenReady().then(async () => {
       return (${readComposerText.toString()})(e);
     })()`);
     assert.equal(repaired, 'First  \nSecond');
-    console.log('Chromium whitespace regression passed: 18 insertions and existing draft repair');
+    console.log('Chromium placeholder regression passed: 21 insertions and existing draft repair');
   } catch (error) {
     console.error(error); process.exitCode = 1;
   } finally {
