@@ -59,7 +59,11 @@ as data and maintain their own delivery state.
 Version 1 includes `source`, hashed `account_key`, `completed_watermark`, explicit
 coverage, and conversations with stable IDs, revision, title, URL, timestamps and
 visible messages. Each message has its source ID, role, text, timestamp and attachment
-count. Raw nodes, hidden reasoning, alternate branches, attachment URLs, credentials,
+count. The additive `citation_groups` field contains visible `grouped_webpages`
+markers and whitelisted source titles/HTTP(S) URLs, derived read-only from existing
+archived references. It omits snippets, tool context, raw metadata and file references.
+Older consumers can ignore this field; absent references produce an empty list.
+Raw nodes, hidden reasoning, alternate branches, attachment URLs, credentials,
 and vault relationships are excluded. A missing or unbound archive is an error.
 Output contains private conversation text and must not be committed or logged.
 

@@ -9,8 +9,57 @@ import re
 import sqlite3
 import stat
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from archive import UUID, VERSION, timestamp
+
+
+CITATION = re.compile('\ue200cite(?:\ue202[^\ue200-\ue2ff\\s]+)+\ue201')
+
+
+def citation_groups(message):
+    """Export only visible citation markers and their web source titles/URLs.
+
+    Do not forward raw reference objects: they can contain snippets, tool context,
+    attachment references and other private metadata. Existing archive rows already
+    preserve these references, so this additive feed field needs no archive rewrite.
+    """
+    groups = []
+    refs = message.get('content_references')
+    if not isinstance(refs, list):
+        return groups
+    for ref in refs[:1024]:
+        if not isinstance(ref, dict) or ref.get('type') != 'grouped_webpages':
+            continue
+        marker = ref.get('matched_text')
+        if not isinstance(marker, str) or len(marker) > 4096 or not CITATION.fullmatch(marker) or marker not in message['text']:
+            continue
+        sources, seen = [], set()
+        items = ref.get('items')
+        if not isinstance(items, list):
+            continue
+        for item in items[:64]:
+            if not isinstance(item, dict):
+                continue
+            url = item.get('url')
+            if not isinstance(url, str) or len(url) > 8192 or any(ord(c) < 33 or ord(c) == 127 for c in url):
+                continue
+            try:
+                parsed = urlsplit(url)
+                if parsed.scheme not in ('https', 'http') or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+                    continue
+            except ValueError:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            title = item.get('attribution') or item.get('title') or parsed.hostname
+            if not isinstance(title, str):
+                title = parsed.hostname
+            sources.append({'title': ' '.join(title.split())[:300], 'url': url})
+        if sources:
+            groups.append({'marker': marker, 'sources': sources})
+    return groups
 
 
 def read_feed(root):
@@ -52,6 +101,7 @@ def read_feed(root):
                     'id': mid, 'role': m['role'], 'text': m['text'],
                     'created_at': timestamp(m['create_time']) if m.get('create_time') is not None else None,
                     'attachment_count': len(m.get('attachments') or []),
+                    'citation_groups': citation_groups(m),
                 })
             conversations.append({
                 'id': cid, 'revision': revision, 'title': data['title'],

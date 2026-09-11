@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from archive import Archive
-from bridge_feed import read_feed
+from bridge_feed import read_feed, citation_groups
 from test_archive import conversation, envelope, node, fingerprint, ID, KEY
 
 
@@ -84,6 +84,44 @@ class BridgeFeedTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(cli), '--archive', str(self.root), 'feed'], capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(result.stdout)['conversations'][0]['id'], ID)
         self.assertEqual(before, fingerprint(self.root))
+
+    def test_citations_are_whitelisted_from_existing_visible_archive(self):
+        marker = '\ue200cite\ue202turn123view0\ue201'
+        data = conversation()
+        message = data['mapping']['a']['message']
+        message['content']['parts'] = ['Answer ' + marker]
+        message['metadata']['content_references'] = [{
+            'type': 'grouped_webpages', 'matched_text': marker,
+            'prompt_text': 'do-not-export', 'alt': 'do-not-export',
+            'items': [{'url': 'https://example.com/docs', 'attribution': 'Example',
+                       'snippet': 'do-not-export', 'refs': ['do-not-export']},
+                      {'url': 'javascript:alert(1)'}, {'url': 'file:///private/file'},
+                      {'url': 'https://secret@example.com/'},
+                      {'url': 'https://example.com/\nsecret'},
+                      {'url': 'https://example.com/docs', 'title': 'duplicate'}],
+        }]
+        self.archive.ingest(envelope(data))
+        before = fingerprint(self.root)
+        feed = read_feed(self.root)
+        self.assertEqual(feed['conversations'][0]['messages'][1]['citation_groups'], [{
+            'marker': marker, 'sources': [{'title': 'Example', 'url': 'https://example.com/docs'}],
+        }])
+        encoded = json.dumps(feed)
+        for excluded in ['do-not-export', 'javascript:', 'file://', 'secret@']:
+            self.assertNotIn(excluded, encoded)
+        self.assertEqual(before, fingerprint(self.root))
+
+    def test_missing_malformed_and_non_web_references_are_ignored(self):
+        marker = '\ue200cite\ue202turn1view0\ue201'
+        self.assertEqual(citation_groups({'text': marker}), [])
+        for ref in [None, 'bad', {'type': 'file', 'matched_text': marker},
+                    {'type': 'grouped_webpages', 'matched_text': 'ordinary words'},
+                    {'type': 'grouped_webpages', 'matched_text': marker, 'items': None},
+                    {'type': 'grouped_webpages', 'matched_text': marker, 'items': [None, {'url': 'https://['}]}]:
+            self.assertEqual(citation_groups({'text': marker, 'content_references': [ref]}), [])
+        self.assertEqual(citation_groups({'text': 'other branch', 'content_references': [{
+            'type': 'grouped_webpages', 'matched_text': marker,
+            'items': [{'url': 'https://example.com'}]}]}), [])
 
 
 if __name__ == '__main__':
