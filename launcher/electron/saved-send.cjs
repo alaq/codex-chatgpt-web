@@ -85,6 +85,38 @@ function readComposerText(editor) {
   }).join("");
 }
 
+// Chromium may turn ordinary spaces into NBSPs when editing collapsible HTML.
+// Permit repairing only that directional substitution in an existing draft.
+// Submission and source acknowledgement still require the requested text itself.
+function repairableComposerDraft(actual, expected) {
+  const wanted = [...expected];
+  return actual.length === expected.length && [...actual].every((char, i) =>
+    char === wanted[i] || char === "\u00a0" && wanted[i] === " ");
+}
+
+// Evaluated in Chromium, including by the renderer regression test. Preserve
+// whitespace during native editing rather than normalizing the submitted text.
+function insertComposerText(editor, text) {
+  editor.focus();
+  if (document.activeElement !== editor) return false;
+  const value = editor.style.getPropertyValue('white-space');
+  const priority = editor.style.getPropertyPriority('white-space');
+  try {
+    editor.style.setProperty('white-space', 'pre-wrap', 'important');
+    if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
+      editor.setSelectionRange(0, editor.value.length);
+    } else {
+      const selection = window.getSelection(), range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges(); selection.addRange(range);
+    }
+    return document.execCommand('insertText', false, text);
+  } finally {
+    if (value) editor.style.setProperty('white-space', value, priority);
+    else editor.style.removeProperty('white-space');
+  }
+}
+
 class SavedSender {
   constructor({ directory, readHistory, openConversation, wait = delay, attempts = 20 }) {
     Object.assign(this, { directory, readHistory, openConversation, wait, attempts });
@@ -183,7 +215,7 @@ async function openSavedConversation(host, id, expectedText) {
       if (state.ready) {
         // A rejected pre-submit attempt can leave its exact draft in ChatGPT.
         // Reuse only that same requested text; never erase an unrelated draft.
-        if (state.text.trim() && state.text.trim() !== expectedText.trim()) throw fail("saved_send_existing_draft");
+        if (state.text.trim() && !repairableComposerDraft(state.text.trim(), expectedText.trim())) throw fail("saved_send_existing_draft");
         ready = true; break;
       }
       await delay(300);
@@ -212,18 +244,12 @@ async function openSavedConversation(host, id, expectedText) {
       if (contents.getURL() !== url) throw fail("saved_send_wrong_page");
       const initial = await contents.executeJavaScript(inspect);
       if (initial.ready && initial.text.trim() === text.trim()) return;
-      if (initial.text.trim()) throw fail("saved_send_existing_draft");
+      if (initial.text.trim() && !repairableComposerDraft(initial.text.trim(), text.trim())) throw fail("saved_send_existing_draft");
       // Match the main adapter's plain-text editing command. insertText is treated
       // as typing by Lexical and can activate Markdown shortcuts or alter newlines.
       const inserted = await contents.executeJavaScript(`(() => {
         const editor = document.querySelector('#prompt-textarea');
-        editor.focus();
-        if (document.activeElement !== editor) return false;
-        const selection = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(editor); range.collapse(false);
-        selection.removeAllRanges(); selection.addRange(range);
-        return document.execCommand('insertText', false, ${JSON.stringify(text)});
+        return (${insertComposerText.toString()})(editor, ${JSON.stringify(text)});
       })()`);
       if (!inserted) throw fail("saved_send_draft_mismatch");
       for (let i = 0; i < 40; i++) {
@@ -268,4 +294,4 @@ async function sendSavedConversation(host, request) {
   catch (e) { throw fail(/^saved_send_[a-z_]+$/.test(e?.code || "") ? e.code : "saved_send_failed"); }
 }
 
-module.exports = { SavedSender, validateRequest, acknowledgedMessage, sendSavedConversation, readComposerText };
+module.exports = { SavedSender, validateRequest, acknowledgedMessage, sendSavedConversation, readComposerText, repairableComposerDraft, insertComposerText };

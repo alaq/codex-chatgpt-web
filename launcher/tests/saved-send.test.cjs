@@ -107,3 +107,13 @@ test("multiline saved request is acknowledged exactly and replayed without dupli
   assert.equal((await new SavedSender(f.opts).send(multiline)).replayed,true);
   assert.equal(f.clicks(),1);
 });
+
+test("only browser-created NBSP substitutions can repair an existing draft", () => {
+  const {repairableComposerDraft: matches} = require('../electron/saved-send.cjs');
+  assert(matches('First line\u00a0\u00a0\nNext', 'First line  \nNext'));
+  assert(matches('✨\u00a0\u00a0\nNext', '✨  \nNext'));
+  assert(matches('A\u00a0B', 'A\u00a0B'));
+  for (const [actual, expected] of [['A B', 'A\u00a0B'], ['A B','A  B'], ['A\nB','A B'], ['Different','Requested']]) {
+    assert(!matches(actual, expected));
+  }
+});

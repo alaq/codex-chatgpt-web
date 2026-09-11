@@ -19,6 +19,7 @@
     "package:linux": "bun run build && bun run build:runtime && bun run scripts/package.cjs --linux",
     "smoke:package": "bun run scripts/smoke-package.cjs",
     "test": "node --test tests/*.test.cjs",
+    "test:saved-editor": "electron tests/fixtures/saved-send-editor.cjs",
     "start": "electron ."
   },
   "dependencies": {

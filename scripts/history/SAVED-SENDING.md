@@ -35,8 +35,11 @@ reads one JSON object from stdin. Prompts and credentials must not appear in arg
 
 Text must be non-empty and no larger than 12,000 UTF-8 bytes. Multiline drafts
 use semantic paragraph/line-break readback instead of layout-derived `innerText`,
-and plain-text insertion avoids editor Markdown shortcuts. An exact existing draft
-from the same rejected request can be reused; a different draft blocks sending. The response has
+and plain-text insertion avoids editor Markdown shortcuts. Native editing temporarily
+uses `white-space: pre-wrap` to preserve ordinary spaces before line breaks, rather
+than allowing Chromium to rewrite them as nonbreaking spaces. An exact existing draft
+can be reused; a draft differing only by that browser-created substitution is repaired
+and checked again before submission. Other draft differences block sending. The response has
 `version: 1` and a status of `accepted`, `not_sent`, or `uncertain`. An accepted
 response includes `userMessageId`, the saved ChatGPT user-message UUID. Acceptance
 does not guarantee a successful assistant response; the collector independently
@@ -57,6 +60,8 @@ calling this endpoint and restores its source association before mirroring, whic
 prevents normal and restart-related outbound echoes. Other callers must provide
 their own durable association and authorization.
 
-Validation: nine sender tests plus the unchanged launcher ownership/control tests;
+Validation: sender tests plus the unchanged launcher ownership/control tests;
+`cd launcher && npm run test:saved-editor` exercises native Chromium insertion and
+draft repair in an isolated, offline profile, including spaces before newlines.
 live source acceptance, idempotent replay, and a Matrix-originated continuation of
 the same saved conversation were verified on September 11, 2026.
