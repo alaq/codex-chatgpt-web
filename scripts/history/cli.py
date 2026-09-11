@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from archive import Archive, private_dir, review, catch_up
+from bridge_feed import read_feed
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -73,10 +74,14 @@ def main():
     c=sub.add_parser('capture',help='Capture selected existing IDs without changing discovery checkpoint')
     c.add_argument('--id',action='append',required=True)
     sub.add_parser('status')
+    sub.add_parser('feed', help='Read a versioned visible-message snapshot for local bridge consumers; no archive or network writes')
     r=sub.add_parser('review',help='Generate destination suggestions; never change vault state')
     r.add_argument('--vault',required=True)
     args=parser.parse_args()
     os.umask(0o077)
+    if args.command == 'feed':
+        print(json.dumps(read_feed(args.archive), ensure_ascii=False, allow_nan=False))
+        return 0
     root=private_dir(args.archive)
     lock_path=root/'.collector.lock'
     if lock_path.is_symlink():

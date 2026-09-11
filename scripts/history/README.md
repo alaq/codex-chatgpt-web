@@ -48,6 +48,21 @@ Safety limits are `--max-batches` (default 25), `--max-pages` (100 pages of disc
 - Capture/restart state is transactional. A process lock serializes writers. Files are owner-only. The pilot retains evidence until deliberately removed; it has no automatic deletion/expiry policy. Keep the archive outside synced/public directories.
 - `review.json` and `review.md` suggest destinations. Exact IDs come from dedicated provenance fields in canonical projects, ideas, evergreens, or archives; redirect provenance resolves to its canonical target. Incidental links do not prove ownership. Non-exact suggestions use lexical overlap and always require review; they are not a trained semantic classifier.
 
+## Local bridge feed
+
+`python3 scripts/history/cli.py feed` returns a versioned JSON snapshot of the
+already-captured visible conversations. It opens SQLite read-only, makes no network
+requests, and does not acquire the collector writer lock or change checkpoints.
+Run `sync` separately to refresh discovery. Consumers must treat conversation text
+as data and maintain their own delivery state.
+
+Version 1 includes `source`, hashed `account_key`, `completed_watermark`, explicit
+coverage, and conversations with stable IDs, revision, title, URL, timestamps and
+visible messages. Each message has its source ID, role, text, timestamp and attachment
+count. Raw nodes, hidden reasoning, alternate branches, attachment URLs, credentials,
+and vault relationships are excluded. A missing or unbound archive is an error.
+Output contains private conversation text and must not be committed or logged.
+
 ## Coverage
 
 Verified locally: regular saved chats, mobile-created chat discovery, continuation of an already captured chat, discovery of an old thread updated after the checkpoint, multiple catch-up batches, no-change repeat, and existing project ID matching. Access does not depend on visiting each chat in the browser. Older histories can be explicitly sampled.
