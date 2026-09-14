@@ -38,3 +38,20 @@ test('generated downloads must be visible links and cannot traverse the sandbox'
  const items=visibleAttachments({current_node:'answer',mapping:{answer:{parent:null,message:m}}},'answer');
  assert.deepEqual(items.map(a=>a.id),['sandbox:/mnt/data/report.pdf']);
 });
+
+test('ChatGPT content endpoints retain first-party authentication',async t=>{
+ const {downloadSavedMedia}=require('../electron/saved-media.cjs'),{createHash}=require('node:crypto');
+ const previous=process.env.CODEX_WEB_GPT_HISTORY_ENABLED;process.env.CODEX_WEB_GPT_HISTORY_ENABLED='1';t.after(()=>{if(previous===undefined)delete process.env.CODEX_WEB_GPT_HISTORY_ENABLED;else process.env.CODEX_WEB_GPT_HISTORY_ENABLED=previous;});
+ const cid='11111111-1111-1111-1111-111111111111',file='file_123456789',accountKey=createHash('sha256').update('chatgpt-history-v1:test-user').digest('hex');
+ let contentFetched=false;
+ const session={fetch:async(url,options)=>{
+  let body;
+  if(url.includes('/estuary/content')){assert.equal(options.headers.authorization,'Bearer synthetic-token');assert.equal(options.credentials,'include');contentFetched=true;return new Response('abc',{headers:{'content-type':'text/plain'}});}
+  if(url.endsWith('/api/auth/session'))body={user:{id:'test-user'},accessToken:'synthetic-token'};
+  else if(url.includes('/files/download/'))body={download_url:'https://chatgpt.com/backend-api/estuary/content?id=private'};
+  else body={conversation_id:cid,current_node:'user',mapping:{user:{parent:null,message:{id:'user',author:{role:'user'},metadata:{attachments:[{id:file,name:'test.txt',size:3}]}}}}};
+  return new Response(JSON.stringify(body),{headers:{'content-type':'application/json'}});
+ }};
+ const result=await downloadSavedMedia({profile:'development',browserInteractionMode:()=> 'automatic',view:{webContents:{session}}},{accountKey,conversationId:cid,messageId:'user',attachmentId:file});
+ assert(contentFetched);assert.equal(Buffer.from(result.data,'base64').toString(),'abc');
+});

@@ -60,8 +60,14 @@ async function downloadSavedMedia(host, request) {
   if (!safeDownloadURL(link.download_url)) throw fail('saved_media_invalid_download');
   // The signed file URL is used only here. Never send the session bearer token
   // to file storage, forward redirects, or export the signed URL to consumers.
-  const response = await session.fetch(link.download_url, {method: 'GET', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(60000)});
-  if (!response.ok) throw fail('saved_media_download_failed');
+  const download=new URL(link.download_url);
+  const firstParty=download.origin==='https://chatgpt.com' && download.pathname.startsWith('/backend-api/');
+  const response = await session.fetch(link.download_url, {method: 'GET', credentials: firstParty ? 'include' : 'omit',
+    ...(firstParty ? {headers:{authorization:`Bearer ${auth.accessToken}`}} : {}),redirect: 'error', signal: AbortSignal.timeout(60000)});
+  if (!response.ok) {
+    host.logger?.warn('saved_media.download_failed',{status:response.status,source:firstParty?'chatgpt':'storage'});
+    throw fail('saved_media_download_failed');
+  }
   const chunks = []; let size = 0;
   for await (const chunk of response.body) { size += chunk.length; if (size > MAX_MEDIA) throw fail('saved_media_too_large'); chunks.push(Buffer.from(chunk)); }
   const bytes = Buffer.concat(chunks);
