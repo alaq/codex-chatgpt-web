@@ -2,7 +2,9 @@ const { createServer } = require("node:http");
 const { randomBytes, timingSafeEqual } = require("node:crypto");
 const { releaseRetainedConversation } = require("./retained-turn-release.cjs");
 const { readSavedHistory } = require("./saved-history.cjs");
-const { sendSavedConversation } = require("./saved-send.cjs");
+const { sendSavedConversation, savedSendStatus } = require("./saved-send.cjs");
+const { downloadSavedMedia } = require('./saved-media.cjs');
+const { createSavedConversation } = require('./saved-create.cjs');
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_MANUAL_START_BODY_BYTES = 3 * 1024 * 1024;
@@ -102,6 +104,9 @@ class BrowserControlServer {
     const isSessionInspect = request.url === "/v1/session/inspect";
     const isHistoryRead = request.url === "/v1/history/read";
     const isSavedSend = request.url === "/v1/saved/send";
+    const isSavedStatus = request.url === "/v1/saved/status";
+    const isSavedMedia = request.url === "/v1/saved/media";
+    const isSavedCreate = request.url === "/v1/saved/create";
     const manualAction = new Map([
       ["/v1/manual/start", "start"],
       ["/v1/manual/wait-sent", "wait-sent"],
@@ -110,18 +115,21 @@ class BrowserControlServer {
       ["/v1/manual/end", "end"],
       ["/v1/manual/cancel", "cancel"],
     ]).get(request.url);
-    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isSessionInspect && !isHistoryRead && !isSavedSend && !manualAction)) {
+    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isSessionInspect && !isHistoryRead && !isSavedSend && !isSavedStatus && !isSavedMedia && !isSavedCreate && !manualAction)) {
       writeJson(response, 404, { error: "not_found" });
       return;
     }
     try {
       const body = await readJson(
         request,
-        manualAction === "start" ? MAX_MANUAL_START_BODY_BYTES : isSavedSend ? 80 * 1024 : MAX_BODY_BYTES,
+        manualAction === "start" ? MAX_MANUAL_START_BODY_BYTES : isSavedSend ? 29 * 1024 * 1024 : isSavedCreate ? 80 * 1024 : MAX_BODY_BYTES,
       );
       const preferences = this.getPreferences();
       const host = this.getBrowserHost();
       if (!host) throw new Error("browser host is not ready");
+      if (isSavedCreate) {writeJson(response,200,await createSavedConversation(host,body));return;}
+      if (isSavedMedia) { writeJson(response, 200, await downloadSavedMedia(host, body)); return; }
+      if (isSavedStatus) { writeJson(response, 200, savedSendStatus(host, body)); return; }
       if (isSavedSend) {
         writeJson(response, 200, await sendSavedConversation(host, body));
         return;

@@ -80,7 +80,13 @@ def normalize(data):
         text_parts = [p if isinstance(p, str) else f"[Non-text content: {p.get('content_type', 'unknown')}; see raw source]" for p in parts if isinstance(p, (str, dict))]
         if content_type == 'code' and isinstance(content.get('text'), str):
             text_parts = ['```' + (content.get('language') or '') + '\n' + content['text'] + '\n```']
-        attachments = metadata.get('attachments') or []
+        attachments = list(metadata.get('attachments') or [])
+        for part in parts:
+            if not isinstance(part,dict) or part.get('content_type')!='image_asset_pointer':continue
+            asset=part.get('asset_pointer','')
+            if isinstance(asset,str) and asset.startswith('file-service://'):asset=asset[len('file-service://'):]
+            if isinstance(asset,str) and re.fullmatch(r'file[-_][A-Za-z0-9_-]{8,128}',asset) and not any(isinstance(a,dict) and a.get('id')==asset for a in attachments):
+                attachments.append({'id':asset,'name':'image.png','mime_type':'image/png','size':0})
         if not text_parts and not attachments:
             if content_type not in ('text', 'multimodal_text'):
                 text_parts = [f'[Content type: {content_type}; see raw source]']

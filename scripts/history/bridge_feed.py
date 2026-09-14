@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import stat
+import mimetypes
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -62,6 +63,40 @@ def citation_groups(message):
     return groups
 
 
+def export_attachments(message):
+    result=[{'id':a['id'],'name':str(a.get('name') or 'attachment'),'mime_type':str(a.get('mime_type') or 'application/octet-stream'),'size':a['size']}
+        for a in (message.get('attachments') or []) if isinstance(a,dict) and isinstance(a.get('id'),str)
+        and re.fullmatch(r'file[-_][A-Za-z0-9_-]{8,128}',a['id']) and isinstance(a.get('size'),int) and 0<=a['size']<=20*1024*1024]
+    for match in re.finditer(r'\]\((sandbox:/mnt/data/[^)\n]+)\)',message['text']):
+        asset=match[1]
+        if not re.fullmatch(r'sandbox:/mnt/data/(?:[A-Za-z0-9_. -]+/)*[A-Za-z0-9_. -]+',asset) or '..' in asset.split('/'):continue
+        if not any(a['id']==asset for a in result):result.append({'id':asset,'name':asset.rsplit('/',1)[1],'mime_type':mimetypes.guess_type(asset)[0] or 'application/octet-stream','size':0})
+    return result
+
+def export_conversation(cid, revision, data):
+    messages, seen = [], set()
+    for m in data['messages']:
+        mid = m.get('id')
+        if not isinstance(mid, str) or not mid or mid in seen or m.get('role') not in ('user', 'assistant') or not isinstance(m.get('text'), str):
+            raise ValueError('Invalid visible message in archive')
+        seen.add(mid)
+        messages.append({
+            'id': mid, 'role': m['role'], 'text': m['text'],
+            'created_at': timestamp(m['create_time']) if m.get('create_time') is not None else None,
+            'attachment_count': len(m.get('attachments') or []),
+            'attachments': export_attachments(m),
+            'citation_groups': citation_groups(m),
+        })
+    return {
+        'kind': 'work' if data.get('conversation_origin') == 'tpp' else 'chatgpt',
+        'id': cid, 'revision': revision, 'title': data['title'],
+        'created_at': timestamp(data['create_time']),
+        'updated_at': timestamp(data['update_time']),
+        'url': 'https://chatgpt.com/c/' + cid,
+        'messages': messages,
+    }
+
+
 def read_feed(root):
     root = Path(root).expanduser().absolute()
     path = root / 'archive.sqlite3'
@@ -91,25 +126,15 @@ def read_feed(root):
                 raise ValueError('Invalid archived conversation identity')
             if data.get('incomplete') or not isinstance(data.get('title'), str):
                 raise ValueError('Invalid or incomplete archived conversation')
-            messages, seen = [], set()
-            for m in data['messages']:
-                mid = m.get('id')
-                if not isinstance(mid, str) or not mid or mid in seen or m.get('role') not in ('user', 'assistant') or not isinstance(m.get('text'), str):
-                    raise ValueError('Invalid visible message in archive')
-                seen.add(mid)
-                messages.append({
-                    'id': mid, 'role': m['role'], 'text': m['text'],
-                    'created_at': timestamp(m['create_time']) if m.get('create_time') is not None else None,
-                    'attachment_count': len(m.get('attachments') or []),
-                    'citation_groups': citation_groups(m),
-                })
-            conversations.append({
-                'id': cid, 'revision': revision, 'title': data['title'],
-                'created_at': timestamp(data['create_time']),
-                'updated_at': timestamp(data['update_time']),
-                'url': 'https://chatgpt.com/c/' + cid,
-                'messages': messages,
-            })
+            conversations.append(export_conversation(cid, revision, data))
+        from bridge_progress import read_progress
+        revisions={cid:revision for cid,revision,_ in rows}
+        for entry in read_progress(root, key):
+            if revisions.get(entry['data']['id'])!=entry.get('base_revision'):continue
+            conversations = [c for c in conversations if c["id"] != entry["data"]["id"]]
+            item = export_conversation(entry["data"]["id"], entry["revision"], entry["data"])
+            item["running"] = entry["running"]
+            conversations.append(item)
         return {
             'version': 1, 'source': 'chatgpt', 'account_key': key,
             'completed_watermark': float(meta['watermark']) if meta.get('watermark') else None,

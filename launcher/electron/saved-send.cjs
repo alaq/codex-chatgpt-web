@@ -11,14 +11,30 @@ const hash = text => createHash("sha256").update(text).digest("hex");
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function fail(code) { const e = new Error(code); e.code = code; return e; }
 
+function attachmentManifest(attachments) {
+  if (attachments == null) return [];
+  if (!Array.isArray(attachments) || attachments.length > 1) throw fail('saved_send_invalid_attachment');
+  return attachments.map(a => {
+    if (!a || typeof a.name !== 'string' || !a.name || a.name.length > 240 || /[\\/\x00-\x1f\x7f]/.test(a.name)
+      || typeof a.mimeType !== 'string' || !/^[\w.+-]+\/[\w.+-]+$/.test(a.mimeType)
+      || typeof a.data !== 'string' || a.data.length > 28 * 1024 * 1024
+      || !HASH.test(a.sha256 || '') || Object.keys(a).some(k => !['name','mimeType','data','sha256'].includes(k))) throw fail('saved_send_invalid_attachment');
+    const bytes = Buffer.from(a.data, 'base64');
+    if (!bytes.length || bytes.length > 20 * 1024 * 1024 || bytes.toString('base64') !== a.data || hash(bytes) !== a.sha256) throw fail('saved_send_invalid_attachment');
+    return {name: a.name, mimeType: a.mimeType, size: bytes.length, sha256: a.sha256};
+  });
+}
+
 function validateRequest(r) {
   if (!r || typeof r !== "object" || Array.isArray(r) || r.version !== 1
     || !UUID.test(r.conversationId || "") || !HASH.test(r.accountKey || "") || !HASH.test(r.transactionId || "")
-    || typeof r.text !== "string" || !r.text.trim() || Buffer.byteLength(r.text) > 12000 || r.text.includes("\0")
-    || Object.keys(r).some(k => !["version", "conversationId", "accountKey", "transactionId", "text"].includes(k))) {
+    || typeof r.text !== "string" || (!r.text.trim() && !r.attachments?.length) || Buffer.byteLength(r.text) > 12000 || r.text.includes("\0")
+    || Object.keys(r).some(k => !["version", "conversationId", "accountKey", "transactionId", "text", "attachments"].includes(k))) {
     throw fail("saved_send_invalid_request");
   }
-  return { version: 1, conversationId: r.conversationId, accountKey: r.accountKey, transactionId: r.transactionId, textHash: hash(r.text) };
+  const attachments = attachmentManifest(r.attachments);
+  return { version: 1, conversationId: r.conversationId, accountKey: r.accountKey, transactionId: r.transactionId, textHash: hash(r.text),
+    ...(attachments.length ? {attachments, attachmentHash: hash(JSON.stringify(attachments))} : {}) };
 }
 
 function privateDirectory(dir) {
@@ -54,9 +70,11 @@ function acknowledgedMessage(data, record) {
   // saved pre-send head, including when a later branch is active. Never click again
   // merely because a response or process was lost.
   const matches = Object.values(data.mapping).filter(n => n?.parent === record.parentId
-    && n.message?.author?.role === "user" && n.message.content?.content_type === "text"
-    && Array.isArray(n.message.content.parts) && n.message.content.parts.every(p => typeof p === "string")
-    && hash(n.message.content.parts.join("\n")) === record.textHash);
+    && n.message?.author?.role === "user" && ['text', 'multimodal_text'].includes(n.message.content?.content_type)
+    && Array.isArray(n.message.content.parts)
+    && hash(n.message.content.parts.filter(p => typeof p === 'string').join("\n")) === record.textHash
+    && (record.attachments || []).length === (n.message.metadata?.attachments || []).length
+    && (record.attachments || []).every(a => (n.message.metadata?.attachments || []).some(b => b.name === a.name && b.size === a.size && b.mime_type === a.mimeType)));
   if (matches.length !== 1 || !UUID.test(matches[0].message.id || "")) return null;
   return matches[0].message.id;
 }
@@ -125,8 +143,8 @@ function insertComposerText(editor, text) {
 }
 
 class SavedSender {
-  constructor({ directory, readHistory, openConversation, wait = delay, attempts = 20 }) {
-    Object.assign(this, { directory, readHistory, openConversation, wait, attempts });
+  constructor({ directory, readHistory, openConversation, wait = delay, attempts = 20, backgroundClose = false, onState = () => {} }) {
+    Object.assign(this, { directory, readHistory, openConversation, wait, attempts, backgroundClose, onState });
     this.busy = false;
   }
   async send(request) {
@@ -134,7 +152,8 @@ class SavedSender {
     if (!path.isAbsolute(this.directory)) throw fail("saved_send_unsafe_state_directory");
     if (this.busy) throw fail("saved_send_busy");
     this.busy = true;
-    let ui;
+    let ui, accepted = false;
+    this.onState(request, 'preparing');
     try {
       privateDirectory(this.directory);
       const dir = path.join(this.directory, hash(`${request.accountKey}:${request.conversationId}`));
@@ -142,7 +161,7 @@ class SavedSender {
       const file = path.join(dir, `${request.transactionId}.json`), activeFile = path.join(dir, "active.json");
       let data = checkedHistory(await this.readHistory(request.conversationId), request);
       const previous = readRecord(file);
-      if (previous && Object.keys(identity).some(k => previous[k] !== identity[k])) throw fail("saved_send_transaction_conflict");
+      if (previous && Object.keys(identity).some(k => JSON.stringify(previous[k]) !== JSON.stringify(identity[k]))) throw fail("saved_send_transaction_conflict");
       const settle = record => {
         if (!record || record.version !== 1 || record.accountKey !== request.accountKey || record.conversationId !== request.conversationId || !HASH.test(record.transactionId || "") || !HASH.test(record.textHash || "") || !["submitting", "accepted"].includes(record.status)) throw fail("saved_send_invalid_record");
         if (record.status === "accepted") {
@@ -151,26 +170,28 @@ class SavedSender {
         }
         const receipt = readRecord(path.join(dir, `${record.transactionId}.json`));
         if (receipt?.status === "accepted") {
-          if (["version", "accountKey", "conversationId", "transactionId", "textHash", "parentId"].some(k => receipt[k] !== record[k]) || !UUID.test(receipt.userMessageId || "")) throw fail("saved_send_invalid_record");
+          if (["version", "accountKey", "conversationId", "transactionId", "textHash", "parentId", "attachmentHash"].some(k => receipt[k] !== record[k]) || !UUID.test(receipt.userMessageId || "")) throw fail("saved_send_invalid_record");
           writeRecord(activeFile, receipt);
           return receipt;
         }
         const id = acknowledgedMessage(data, record);
         if (!id) throw fail("saved_send_uncertain");
-        record = { ...record, status: "accepted", userMessageId: id };
+        const sourceMessage = Object.values(data.mapping).find(n => n.message?.id === id)?.message;
+        record = { ...record, status: "accepted", userMessageId: id, attachmentIDs: (sourceMessage?.metadata?.attachments || []).map(a => a.id) };
         writeRecord(path.join(dir, `${record.transactionId}.json`), record);
         writeRecord(activeFile, record);
         return record;
       };
       if (previous) {
         const done = settle(previous);
-        return { version: 1, status: "accepted", userMessageId: done.userMessageId, replayed: true };
+        accepted = true;
+        return { version: 1, status: "accepted", userMessageId: done.userMessageId, attachmentIDs: done.attachmentIDs || [], replayed: true };
       }
       const active = readRecord(activeFile);
       if (active) settle(active); // An unresolved prior attempt blocks new sends to this chat.
       checkIdle(data);
       const parentId = data.current_node;
-      ui = await this.openConversation(request.conversationId, request.text);
+      ui = await this.openConversation(request.conversationId, request.text, request.attachments || []);
       await ui.prepare(request.text);
       data = checkedHistory(await this.readHistory(request.conversationId), request);
       checkIdle(data);
@@ -185,7 +206,8 @@ class SavedSender {
         try {
           data = checkedHistory(await this.readHistory(request.conversationId), request);
           const done = settle(record);
-          return { version: 1, status: "accepted", userMessageId: done.userMessageId, replayed: false };
+          accepted = true;
+          return { version: 1, status: "accepted", userMessageId: done.userMessageId, attachmentIDs: done.attachmentIDs || [], replayed: false };
         } catch (error) {
           if (error.code === "saved_send_account_mismatch") throw fail("saved_send_uncertain");
           if (attempt + 1 < this.attempts) await this.wait(1000);
@@ -193,24 +215,34 @@ class SavedSender {
       }
       throw fail("saved_send_uncertain");
     } finally {
-      try { await ui?.close(); } finally { this.busy = false; }
+      const close = async () => {
+        try { await ui?.close(running => this.onState(request, running ? 'generating' : 'complete')); }
+        finally { this.busy = false; if (!accepted) this.onState(request, 'needs_recovery'); }
+      };
+      if (accepted) this.onState(request, 'accepted');
+      // The original receipt is durable. Return it now; keep the generation page
+      // alive independently, and retain the sender lock until that page settles.
+      if (accepted && ui && this.backgroundClose) void close().catch(() => this.onState(request, 'needs_recovery'));
+      else await close();
     }
   }
 }
 
-async function openSavedConversation(host, id, expectedText) {
+async function openSavedConversation(host, id, expectedText, attachments = []) {
   const { BrowserWindow } = require("electron");
-  const url = `https://chatgpt.com/c/${id}`;
+  const creating = id === 'new';
+  const url = creating ? 'https://chatgpt.com/' : `https://chatgpt.com/c/${id}`;
   const win = new BrowserWindow({ show: false, width: 1000, height: 900, webPreferences: {
     session: host.view.webContents.session, nodeIntegration: false, contextIsolation: true, sandbox: true, backgroundThrottling: false,
   } });
   const contents = win.webContents;
   contents.setWindowOpenHandler(() => ({ action: "deny" }));
-  contents.on("will-navigate", (event, target) => { if (target !== url) event.preventDefault(); });
+  contents.on("will-navigate", (event, target) => { if (target !== url && !(creating && /^https:\/\/chatgpt\.com\/c\/[a-f0-9-]{36}$/.test(target))) event.preventDefault(); });
   const inspect = `(() => {
     const editor = document.querySelector('#prompt-textarea');
     const stop = document.querySelector('[data-testid="stop-button"]');
     return {ready: !!editor && (editor.isContentEditable || editor.tagName === 'TEXTAREA') && !stop,
+      temporary: !!document.querySelector('[data-testid="temporary-chat-indicator"], [data-testid="temporary-chat-banner"]'),
       text: (${readComposerText.toString()})(editor)};
   })()`;
   try {
@@ -219,6 +251,7 @@ async function openSavedConversation(host, id, expectedText) {
     for (let i = 0; i < 100; i++) {
       if (contents.getURL() !== url) throw fail("saved_send_wrong_page");
       const state = await contents.executeJavaScript(inspect);
+      if (creating && state.temporary) throw fail('saved_create_temporary_mode');
       if (state.ready) {
         // A rejected pre-submit attempt can leave its exact draft in ChatGPT.
         // Reuse only that same requested text; never erase an unrelated draft.
@@ -247,8 +280,34 @@ async function openSavedConversation(host, id, expectedText) {
     throw fail(error.code === "saved_send_existing_draft" ? error.code : diagnostic.challenge ? 'saved_send_challenge' : diagnostic.loginRequired ? 'saved_send_login_required' : "saved_send_composer_unavailable");
   }
   return {
+    async conversationId() { return contents.getURL().match(/^https:\/\/chatgpt\.com\/c\/([a-f0-9-]{36})$/)?.[1] || null; },
     async prepare(text) {
       if (contents.getURL() !== url) throw fail("saved_send_wrong_page");
+      if (attachments.length) {
+        const staged = await contents.executeJavaScript(`(() => {
+          const input = document.querySelector('input[data-testid="upload-photos-input"]');
+          if (!input || document.querySelector('form [role="group"][aria-label]')) return false;
+          const transfer = new DataTransfer();
+          for (const a of ${JSON.stringify(attachments)}) {
+            const raw = atob(a.data), bytes = new Uint8Array(raw.length);
+            for (let i=0;i<raw.length;i++) bytes[i] = raw.charCodeAt(i);
+            transfer.items.add(new File([bytes], a.name, {type:a.mimeType}));
+          }
+          input.files = transfer.files; input.dispatchEvent(new Event('change', {bubbles:true})); return true;
+        })()`);
+        if (!staged) throw fail('saved_send_attachment_upload_failed');
+        let ready = false;
+        for (let i=0;i<120;i++) {
+          ready = await contents.executeJavaScript(`(() => {
+            const names = ${JSON.stringify(attachments.map(a => a.name))};
+            const groups = Array.from(document.querySelectorAll('form [role="group"]')).map(e=>e.getAttribute('aria-label'));
+            const button = document.querySelector('button[data-testid="send-button"]');
+            return names.every(name=>groups.includes(name)) && !!button && !button.disabled;
+          })()`);
+          if (ready) break; await delay(500);
+        }
+        if (!ready) throw fail('saved_send_attachment_upload_failed');
+      }
       const initial = await contents.executeJavaScript(inspect);
       if (initial.ready && initial.text.trim() === text.trim()) return;
       if (initial.text.trim() && !repairableComposerDraft(initial.text.trim(), text.trim())) throw fail("saved_send_existing_draft");
@@ -276,29 +335,45 @@ async function openSavedConversation(host, id, expectedText) {
       })()`);
       if (!result) throw fail("saved_send_submit_unavailable");
     },
-    async close() {
+    async close(onGeneration = () => {}) {
       // Keep the page alive while ChatGPT streams. The user-message receipt is
       // already durable, so even a timeout here must never trigger another click.
       try {
-        for (let i = 0; i < 90 && !win.isDestroyed(); i++) {
+        let completed = false;
+        for (let i = 0; i < 300 && !win.isDestroyed(); i++) {
           const running = await contents.executeJavaScript(`!!document.querySelector('[data-testid="stop-button"]')`);
-          if (!running) break;
+          onGeneration(running);
+          if (!running) {completed=true;break;}
           await delay(2000);
         }
+        if(!completed) throw fail('saved_send_generation_unobserved');
       } finally { if (!win.isDestroyed()) win.destroy(); }
     },
   };
 }
 
 let sender;
+const sendStates = new Map();
+function recordSendState(request, phase) {
+  sendStates.set(`${request.accountKey}:${request.conversationId}`, {version: 1, phase, updatedAt: Date.now()});
+  for (const [key, value] of sendStates) if (Date.now() - value.updatedAt > 10 * 60 * 1000) sendStates.delete(key);
+}
+function savedSendStatus(host, request) {
+  if (host.profile !== 'development' || process.env.CODEX_WEB_GPT_SAVED_SEND_ENABLED !== '1') throw fail('saved_send_disabled');
+  if (!request || !HASH.test(request.accountKey || '') || !UUID.test(request.conversationId || '') || Object.keys(request).some(k => !['accountKey', 'conversationId'].includes(k))) throw fail('saved_send_invalid_request');
+  const state = sendStates.get(`${request.accountKey}:${request.conversationId}`);
+  return state && Date.now() - state.updatedAt < 300000 ? state : {version: 1, phase: 'idle', updatedAt: Date.now()};
+}
 async function sendSavedConversation(host, request) {
   if (host.profile !== "development" || process.env.CODEX_WEB_GPT_SAVED_SEND_ENABLED !== "1" || !process.env.CODEX_WEB_GPT_SAVED_SEND_DIR || host.browserInteractionMode() !== "automatic") throw fail("saved_send_disabled");
   validateRequest(request);
   sender ??= new SavedSender({ directory: process.env.CODEX_WEB_GPT_SAVED_SEND_DIR,
+    backgroundClose: true, onState: recordSendState,
     readHistory: id => readSavedHistory(host, { operation: "conversation", id }),
-    openConversation: (id, text) => openSavedConversation(host, id, text) });
+    openConversation: (id, text, attachments) => openSavedConversation(host, id, text, attachments) });
   try { return await host.withManualOperation("saved conversation send", () => sender.send(request)); }
   catch (e) { throw fail(/^saved_send_[a-z_]+$/.test(e?.code || "") ? e.code : "saved_send_failed"); }
 }
 
-module.exports = { SavedSender, validateRequest, acknowledgedMessage, sendSavedConversation, readComposerText, repairableComposerDraft, insertComposerText };
+module.exports = { SavedSender, validateRequest, acknowledgedMessage, sendSavedConversation, savedSendStatus, readComposerText, repairableComposerDraft, insertComposerText,
+  openSavedConversation, privateDirectory, readRecord, writeRecord, recordSendState };

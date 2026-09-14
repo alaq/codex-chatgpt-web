@@ -32,6 +32,28 @@ test("source acknowledgement survives restart and duplicate request without anot
   assert.equal(retry.replayed, true); assert.equal(f.clicks(), 1);
   await assert.rejects(f.sender.send({ ...request, text: "changed" }), /transaction_conflict/);
 });
+
+test('durable receipt returns before generation finishes and sender remains locked', async t => {
+  const f = fixture(t); let finish; const generation = new Promise(resolve => finish = resolve); const states = [];
+  const open = f.opts.openConversation;
+  const sender = new SavedSender({...f.opts, backgroundClose:true, onState:(_r, phase)=>states.push(phase),
+    openConversation:async (...args)=>({...await open(...args), close:async observe=>{observe(true);await generation;observe(false);}})});
+  assert.equal((await sender.send(request)).status,'accepted');
+  assert.equal(sender.busy,true); assert(states.includes('generating'));
+  await assert.rejects(sender.send({...request,transactionId:'c'.repeat(64)}),/saved_send_busy/);
+  finish(); await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(sender.busy,false); assert.equal(states.at(-1),'complete');
+});
+
+test('attachment request is content-verified and receipt survives restart', async t => {
+  const {createHash}=require('node:crypto'); const f=fixture(t); const bytes=Buffer.from('a small document');
+  const a={name:'note.txt',mimeType:'text/plain',data:bytes.toString('base64'),sha256:createHash('sha256').update(bytes).digest('hex')};
+  const r={...request,text:'',attachments:[a]};
+  assert.throws(()=>validateRequest({...r,attachments:[{...a,data:Buffer.from('changed').toString('base64')}]}),/invalid_attachment/);
+  f.submit(()=>{f.data.mapping[userId]={parent:'head',message:{id:userId,author:{role:'user'},content:{content_type:'multimodal_text',parts:[]},metadata:{attachments:[{id:'file_123456789',name:a.name,size:bytes.length,mime_type:a.mimeType}]}}};f.data.current_node=userId;});
+  assert.deepEqual((await f.sender.send(r)).attachmentIDs,['file_123456789']);
+  assert.deepEqual((await new SavedSender(f.opts).send(r)).attachmentIDs,['file_123456789']);assert.equal(f.clicks(),1);
+});
 test("lost click response reconciles the saved user node", async t => {
   const f = fixture(t);
   f.submit(() => {

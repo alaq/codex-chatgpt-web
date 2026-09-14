@@ -13,6 +13,23 @@ from test_archive import conversation, envelope, node, fingerprint, ID, KEY
 
 
 class BridgeFeedTests(unittest.TestCase):
+    def test_progress_has_only_finished_messages_and_completed_archive_wins(self):
+        from bridge_progress import record_progress
+        data=conversation();data['conversation_origin']='tpp';self.archive.ingest(envelope(data))
+        data['mapping']['u2']=node('u2','user','New request','a')
+        data['mapping']['partial']=node('partial','assistant','UNFINISHED DO NOT MIRROR','u2')
+        data['mapping']['partial']['message']['status']='in_progress'
+        data['current_node']='partial';data['update_time']=3000
+        record_progress(self.root,envelope(data))
+        feed=read_feed(self.root)['conversations'][0]
+        self.assertEqual(feed['kind'],'work');self.assertTrue(feed['running']);self.assertEqual(len(feed['messages']),3)
+        self.assertNotIn('UNFINISHED',json.dumps(feed))
+        self.assertEqual(len(self.archive.current(ID)['data']['messages']),2)
+        data['mapping']['partial']['message']['status']='finished_successfully';data['mapping']['partial']['message']['content']['parts']=['Finished answer']
+        self.archive.ingest(envelope(data))  # A separate non-bridge collector may finish it.
+        completed=read_feed(self.root)['conversations'][0]
+        self.assertFalse(completed.get('running',False));self.assertEqual(completed['messages'][-1]['text'],'Finished answer')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

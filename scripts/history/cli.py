@@ -20,7 +20,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Client:
-    def __init__(self, descriptor):
+    def __init__(self, descriptor, progress_root=None):
+        self.progress_root=progress_root
         path = Path(descriptor).expanduser()
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -56,6 +57,9 @@ class Client:
             raise RuntimeError('Local history request failed or timed out') from None
         if result.get('version') != 1 or not isinstance(result.get('raw'), str):
             raise ValueError('Invalid history response envelope')
+        if self.progress_root and body.get('operation')=='conversation':
+            from bridge_progress import record_progress
+            record_progress(self.progress_root,result)
         return result
 
 
@@ -71,6 +75,7 @@ def main():
     s.add_argument('--max-batches',type=int,default=25,help='Safety cap; unfinished catch-up retains its previous checkpoint')
     s.add_argument('--page-size',type=int,default=20)
     s.add_argument('--refresh-known',action='store_true',help='Refetch known overlapping chats even when update timestamps match')
+    s.add_argument('--bridge-progress',action='store_true',help='Stage completed visible messages from unfinished turns for the bridge; keep the archive checkpoint behind them')
     c=sub.add_parser('capture',help='Capture selected existing IDs without changing discovery checkpoint')
     c.add_argument('--id',action='append',required=True)
     sub.add_parser('status')
@@ -94,7 +99,7 @@ def main():
         archive=Archive(root)
         try:
             if args.command=='sync':
-                result=catch_up(archive,Client(args.descriptor),args.since,args.batch_size,args.max_batches,args.max_pages,args.page_size,args.refresh_known)
+                result=catch_up(archive,Client(args.descriptor,root if args.bridge_progress else None),args.since,args.batch_size,args.max_batches,args.max_pages,args.page_size,args.refresh_known)
                 result['transcripts_written']=archive.render()
             elif args.command=='capture':
                 if len(args.id)>10:
@@ -111,6 +116,8 @@ def main():
                         'node_versions':archive.db.execute('SELECT count(*) FROM node_versions').fetchone()[0],
                         'watermark':archive.meta('watermark'),'account_bound':archive.meta('account_key') is not None}
             print(json.dumps(result,indent=2))
+            if args.command=='sync' and args.bridge_progress and result.get('errors') and all(e['error']=='Conversation is still generating; retry after completion' for e in result['errors']):
+                return 0  # Expected progress; the completed watermark remains unchanged.
             return 0 if result.get('complete_window',True) else 2
         finally:
             archive.close()

@@ -13,8 +13,8 @@ def main():
     parser.add_argument('--descriptor', required=True)
     args = parser.parse_args()
     client = Client(args.descriptor)
-    raw = sys.stdin.buffer.read(80 * 1024 + 1)
-    if len(raw) > 80 * 1024:
+    raw = sys.stdin.buffer.read(29 * 1024 * 1024 + 1)
+    if len(raw) > 29 * 1024 * 1024:
         raise ValueError('Saved send request too large')
     body = json.loads(raw)
     request = urllib.request.Request(client.endpoint.rstrip('/') + '/v1/saved/send', data=json.dumps(body).encode(),
@@ -31,7 +31,8 @@ def main():
         allowed = {'saved_send_uncertain', 'saved_send_busy', 'saved_send_source_busy', 'saved_send_source_changed',
                    'saved_send_disabled', 'saved_send_account_mismatch', 'saved_send_transaction_conflict',
                    'saved_send_composer_unavailable', 'saved_send_draft_mismatch', 'saved_send_wrong_page',
-                   'saved_send_existing_draft', 'saved_send_challenge', 'saved_send_login_required'}
+                   'saved_send_existing_draft', 'saved_send_challenge', 'saved_send_login_required',
+                   'saved_send_invalid_attachment', 'saved_send_attachment_upload_failed'}
         result = {'version': 1, 'status': 'uncertain' if code not in allowed or code == 'saved_send_uncertain' else 'not_sent',
                   'error': code if code in allowed else 'saved_send_failed'}
     except (urllib.error.URLError, TimeoutError):
