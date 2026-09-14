@@ -38,7 +38,8 @@ class SavedCreator {
           const envelope=await this.history(candidate.id);
           if(envelope.accountKey!==request.accountKey)throw fail('saved_create_account_mismatch');
           const data=JSON.parse(envelope.raw);
-          if((data.conversation_id||data.id)!==candidate.id||data.is_temporary||!data.mapping||!data.current_node||Number(data.create_time)<Date.parse(record.createdAt)/1000-5)continue;
+          const created=typeof data.create_time==='number'?data.create_time:Date.parse(data.create_time)/1000;
+          if((data.conversation_id||data.id)!==candidate.id||data.is_temporary||!data.mapping||!data.current_node||!Number.isFinite(created)||created<Date.parse(record.createdAt)/1000-5)continue;
           const users=Object.values(data.mapping).filter(n=>n.message?.author?.role==='user');
           const first=users.filter(n=>Array.isArray(n.message.content?.parts)&&n.message.content.parts.every(p=>typeof p==='string')&&hash(n.message.content.parts.join('\n'))===record.textHash);
           if(users.length===1&&first.length===1&&UUID.test(first[0].message.id||''))matches.push({conversationId:candidate.id,userMessageId:first[0].message.id});

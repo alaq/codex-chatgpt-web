@@ -30,3 +30,10 @@ test('creation journal contains hashes and identity, never the prompt',async t=>
  const f=fixture(t);await new SavedCreator(f.opts).create(request);
  const file=path.join(f.opts.directory,'new-'+request.accountKey,request.transactionId+'.json');assert.equal(fs.statSync(file).mode&0o777,0o600);assert(!fs.readFileSync(file,'utf8').includes(request.text));
 });
+
+test('creation rejects old or malformed creation times even with matching text',async t=>{
+ for(const value of ['2020-01-01T00:00:00Z','not-a-date',null]){
+  const f=fixture(t);f.data.create_time=value;await assert.rejects(new SavedCreator(f.opts).create(request),/uncertain/);assert.equal(f.clicks(),1);
+ }
+ const f=fixture(t);f.data.create_time=new Date().toISOString();assert.equal((await new SavedCreator(f.opts).create(request)).conversationId,cid);
+});
