@@ -12,10 +12,14 @@ import mimetypes
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from archive import UUID, VERSION, timestamp
+from archive import UUID, VERSION, timestamp, digest
 
 
 CITATION = re.compile('\ue200cite(?:\ue202[^\ue200-\ue2ff\\s]+)+\ue201')
+
+
+def delivery_fingerprint(kind, revision):
+    return digest(['bridge-delivery-v1', kind, revision])
 
 
 def citation_groups(message):
@@ -97,7 +101,7 @@ def export_conversation(cid, revision, data):
     }
 
 
-def read_feed(root, max_conversations=10, allowed_conversations=None):
+def read_feed(root, max_conversations=10, allowed_conversations=None, known_fingerprints=None):
     if not isinstance(max_conversations, int) or isinstance(max_conversations, bool) or not 1 <= max_conversations <= 100:
         raise ValueError('Bridge feed conversation limit must be between 1 and 100')
     allowed = [item for item in (allowed_conversations or []) if isinstance(item, str) and UUID.fullmatch(item)]
@@ -125,24 +129,51 @@ def read_feed(root, max_conversations=10, allowed_conversations=None):
             ORDER BY source_update DESC,id DESC LIMIT ?
           ) ORDER BY source_update,id''',
           (int(bool(allowed_conversations)), json.dumps(allowed), max_conversations)).fetchall()
-        from bridge_progress import progress_candidates, read_progress
+        from bridge_progress import progress_candidates, progress_delivery_fingerprint, read_progress
         progress_meta = progress_candidates(root, allowed if allowed_conversations else None)
         candidates = {cid: (False, updated, cid) for cid, _revision, updated in metadata}
         for entry in progress_meta:
             candidates[entry['id']] = (entry['running'], entry['observed_at'], entry['id'])
         selected = {item[2] for item in sorted(candidates.values())[-max_conversations:]}
-        rows = db.execute('''SELECT id,revision,normalized FROM conversations
+        progress_by_id = {entry['id']: entry for entry in progress_meta if entry['id'] in selected}
+        rows = db.execute('''SELECT id,revision,source_update FROM conversations
             WHERE id IN (SELECT value FROM json_each(?)) ORDER BY source_update,id''',
             (json.dumps(sorted(selected)),)).fetchall()
+        changed_archive_ids = []
         conversations = []
-        for cid, revision, encoded in rows:
+        for cid, revision, source_update in rows:
+            progress_candidate = progress_by_id.get(cid)
+            if progress_candidate and (known_fingerprints or {}).get(cid) == progress_candidate['delivery_fingerprint'] and progress_candidate['delivery_fingerprint'] == progress_delivery_fingerprint(progress_candidate['path'].lstat()):
+                continue
+            fingerprint = delivery_fingerprint('chatgpt', revision)
+            if (known_fingerprints or {}).get(cid) == fingerprint:
+                conversations.append({'id': cid, 'delivery_fingerprint': fingerprint,
+                                      'unchanged': True, 'updated_at': source_update,
+                                      'messages': []})
+                continue
+            changed_archive_ids.append(cid)
+        payloads = {} if not changed_archive_ids else dict(db.execute('''SELECT id,normalized FROM conversations
+            WHERE id IN (SELECT value FROM json_each(?))''',
+            (json.dumps(changed_archive_ids),)).fetchall())
+        for cid, revision, source_update in rows:
+            if cid not in changed_archive_ids:
+                continue
+            encoded = payloads[cid]
+            fingerprint = delivery_fingerprint('chatgpt', revision)
             data = json.loads(encoded)
             if not UUID.fullmatch(cid) or cid != data.get('id') or not re.fullmatch('[a-f0-9]{64}', revision):
                 raise ValueError('Invalid archived conversation identity')
             if data.get('incomplete') or not isinstance(data.get('title'), str):
                 raise ValueError('Invalid or incomplete archived conversation')
-            conversations.append(export_conversation(cid, revision, data))
-        progress = read_progress(root, key, selected)
+            item = export_conversation(cid, revision, data)
+            item['delivery_fingerprint'] = fingerprint
+            conversations.append(item)
+        selected_progress = list(progress_by_id.values())
+        unchanged_progress_ids = {entry['id'] for entry in selected_progress
+                                  if (known_fingerprints or {}).get(entry['id']) == entry['delivery_fingerprint']
+                                  and entry['delivery_fingerprint'] == progress_delivery_fingerprint(entry['path'].lstat())}
+        changed_progress = [entry for entry in selected_progress if entry['id'] not in unchanged_progress_ids]
+        progress = read_progress(root, key, candidates=changed_progress)
         revisions={cid:revision for cid,revision,_ in rows}
         for entry in progress:
             cid = entry['data']['id']
@@ -155,7 +186,18 @@ def read_feed(root, max_conversations=10, allowed_conversations=None):
             conversations = [c for c in conversations if c["id"] != entry["data"]["id"]]
             item = export_conversation(entry["data"]["id"], entry["revision"], entry["data"])
             item["running"] = entry["running"]
+            candidate = next(candidate for candidate in selected_progress if candidate['id'] == entry['data']['id'])
+            if candidate['delivery_fingerprint'] == progress_delivery_fingerprint(candidate['path'].lstat()):
+                item["delivery_fingerprint"] = candidate['delivery_fingerprint']
             conversations.append(item)
+        opened_progress_ids = {entry['id'] for entry in changed_progress}
+        for candidate in selected_progress:
+            if candidate['id'] in opened_progress_ids:
+                continue
+            conversations = [c for c in conversations if c['id'] != candidate['id']]
+            conversations.append({'id': candidate['id'], 'delivery_fingerprint': candidate['delivery_fingerprint'],
+                                  'unchanged': True, 'running': candidate['running'], 'running_known': True,
+                                  'updated_at': candidate['observed_at'], 'messages': []})
         conversations.sort(key=lambda item: (bool(item.get('running')), item['updated_at'], item['id']))
         conversations = conversations[-max_conversations:]
         conversations.sort(key=lambda item: (item['updated_at'], item['id']))

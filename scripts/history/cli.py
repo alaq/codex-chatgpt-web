@@ -9,9 +9,20 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import re
 from pathlib import Path
-from archive import Archive, private_dir, review, catch_up
+from archive import Archive, private_dir, review, catch_up, UUID
 from bridge_feed import read_feed
+
+
+def known_fingerprints(values):
+    result = {}
+    for value in values:
+        cid, separator, fingerprint = value.partition('=')
+        if not separator or not UUID.fullmatch(cid) or not re.fullmatch('[a-f0-9]{64}', fingerprint) or cid in result:
+            raise ValueError('Invalid known conversation fingerprint')
+        result[cid] = fingerprint
+    return result
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -82,12 +93,14 @@ def main():
     f=sub.add_parser('feed', help='Read a bounded visible-message snapshot for local bridge consumers; no archive or network writes')
     f.add_argument('--max-conversations', type=int, default=10)
     f.add_argument('--allow-conversation', action='append', default=[])
+    f.add_argument('--known-conversation', action='append', default=[])
     r=sub.add_parser('review',help='Generate destination suggestions; never change vault state')
     r.add_argument('--vault',required=True)
     args=parser.parse_args()
     os.umask(0o077)
     if args.command == 'feed':
-        print(json.dumps(read_feed(args.archive, args.max_conversations, args.allow_conversation), ensure_ascii=False, allow_nan=False))
+        print(json.dumps(read_feed(args.archive, args.max_conversations, args.allow_conversation,
+                                   known_fingerprints(args.known_conversation)), ensure_ascii=False, allow_nan=False))
         return 0
     root=private_dir(args.archive)
     lock_path=root/'.collector.lock'

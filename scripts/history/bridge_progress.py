@@ -14,6 +14,11 @@ import tempfile
 import time
 from archive import normalize, digest, UUID
 
+
+def progress_delivery_fingerprint(info):
+    return digest(['bridge-progress-delivery-v1', info.st_dev, info.st_ino,
+                   info.st_size, info.st_mtime_ns, info.st_ctime_ns])
+
 def record_progress(root, envelope):
     data=json.loads(envelope['raw'])
     if not isinstance(data.get('mapping'),dict):return
@@ -53,13 +58,14 @@ def progress_candidates(root, allowed_ids=None):
         info=file.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>32*1024*1024:raise ValueError('Unsafe progress record')
         if not UUID.fullmatch(cid):raise ValueError('Progress conversation mismatch')
-        candidates.append({'id':cid,'observed_at':info.st_mtime,'running':time.time()-info.st_mtime<300,'path':file})
+        candidates.append({'id':cid,'observed_at':info.st_mtime,'running':time.time()-info.st_mtime<300,
+                           'delivery_fingerprint':progress_delivery_fingerprint(info),'path':file})
     candidates.sort(key=lambda item:(item['observed_at'],item['id']))
     return candidates[-100:]
 
-def read_progress(root,account,allowed_ids=None):
+def read_progress(root,account,allowed_ids=None, candidates=None):
     entries=[]
-    for candidate in progress_candidates(root,allowed_ids):
+    for candidate in candidates if candidates is not None else progress_candidates(root,allowed_ids):
         file=candidate['path'];entry=json.loads(file.read_text());cid=entry['data']['id']
         if entry['account_key']!=account or not UUID.fullmatch(cid) or file.stem!=cid:raise ValueError('Progress account or conversation mismatch')
         entry['running']=time.time()-entry['observed_at']<300

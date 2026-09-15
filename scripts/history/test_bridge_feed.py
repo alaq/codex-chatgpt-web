@@ -1,14 +1,18 @@
 import copy
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from archive import Archive
-from bridge_feed import read_feed, citation_groups
+from bridge_feed import read_feed
+from bridge_feed import delivery_fingerprint, citation_groups
+from bridge_progress import progress_delivery_fingerprint
 from test_archive import conversation, envelope, node, fingerprint, ID, KEY
 
 
@@ -219,6 +223,44 @@ class BridgeFeedTests(unittest.TestCase):
         self.assertEqual(citation_groups({'text': 'other branch', 'content_references': [{
             'type': 'grouped_webpages', 'matched_text': marker,
             'items': [{'url': 'https://example.com'}]}]}), [])
+
+    def test_known_delivery_fingerprint_skips_normalized_decode(self):
+        cid = '11111111-1111-1111-1111-111111111111'
+        revision = 'b' * 64
+        self.archive.set_meta('account_key', KEY)
+        with self.archive.db:
+            self.archive.db.execute('INSERT INTO conversations VALUES (?,?,?,?)',
+                                    (cid, revision, 200, '{malformed'))
+        known = {cid: delivery_fingerprint('chatgpt', revision)}
+        real_connect = sqlite3.connect
+        def protected_connect(*args, **kwargs):
+            db = real_connect(*args, **kwargs)
+            db.set_authorizer(lambda action, _table, column, *_:
+                              sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ and column == 'normalized'
+                              else sqlite3.SQLITE_OK)
+            return db
+        with patch('bridge_feed.sqlite3.connect', side_effect=protected_connect):
+            result = read_feed(self.root, known_fingerprints=known)
+        self.assertEqual(len(result['conversations']), 1)
+        item = result['conversations'][0]
+        self.assertTrue(item['unchanged'])
+        self.assertEqual(item['messages'], [])
+        self.assertEqual(item['delivery_fingerprint'], known[cid])
+
+    def test_known_progress_fingerprint_skips_progress_json_decode(self):
+        self.archive.set_meta('account_key', KEY)
+        directory = self.root / 'bridge-progress'
+        directory.mkdir(mode=0o700)
+        path = directory / (ID + '.json')
+        path.write_text('{malformed')
+        os.chmod(path, 0o600)
+        known = {ID: progress_delivery_fingerprint(path.lstat())}
+        result = read_feed(self.root, known_fingerprints=known)
+        self.assertEqual(result['conversations'], [{
+            'id': ID, 'delivery_fingerprint': known[ID], 'unchanged': True,
+            'running': True, 'running_known': True,
+            'updated_at': path.stat().st_mtime, 'messages': [],
+        }])
 
 
 if __name__ == '__main__':

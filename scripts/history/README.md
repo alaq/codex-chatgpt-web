@@ -55,6 +55,9 @@ most recently updated already-captured visible conversations. Override the bound
 count with `feed --max-conversations N` (1–100). Selection happens in SQLite before
 normalized transcripts are decoded. The command opens SQLite read-only, makes no network
 requests, and does not acquire the collector writer lock or change checkpoints.
+Bridge consumers may pass a previously completed `--known-conversation ID=SHA256`.
+When the versioned delivery fingerprint still matches, the feed returns a small
+unchanged marker and does not decode the archived transcript or progress record.
 Run `sync` separately to refresh discovery. Consumers must treat conversation text
 as data and maintain their own delivery state.
 
