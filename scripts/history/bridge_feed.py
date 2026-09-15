@@ -97,7 +97,10 @@ def export_conversation(cid, revision, data):
     }
 
 
-def read_feed(root):
+def read_feed(root, max_conversations=10, allowed_conversations=None):
+    if not isinstance(max_conversations, int) or isinstance(max_conversations, bool) or not 1 <= max_conversations <= 100:
+        raise ValueError('Bridge feed conversation limit must be between 1 and 100')
+    allowed = [item for item in (allowed_conversations or []) if isinstance(item, str) and UUID.fullmatch(item)]
     root = Path(root).expanduser().absolute()
     path = root / 'archive.sqlite3'
     for item in (root, path):
@@ -116,9 +119,21 @@ def read_feed(root):
         key = meta.get('account_key', '')
         if not re.fullmatch('[a-f0-9]{64}', key):
             raise ValueError('Archive has no verified account; run collection first')
-        rows = db.execute('SELECT id,revision,normalized FROM conversations ORDER BY id LIMIT 10001').fetchall()
-        if len(rows) > 10000:
-            raise ValueError('Bridge feed conversation limit exceeded')
+        metadata = db.execute('''SELECT id,revision,source_update FROM (
+            SELECT id,revision,source_update FROM conversations
+            WHERE (?=0 OR id IN (SELECT value FROM json_each(?)))
+            ORDER BY source_update DESC,id DESC LIMIT ?
+          ) ORDER BY source_update,id''',
+          (int(bool(allowed_conversations)), json.dumps(allowed), max_conversations)).fetchall()
+        from bridge_progress import progress_candidates, read_progress
+        progress_meta = progress_candidates(root, allowed if allowed_conversations else None)
+        candidates = {cid: (False, updated, cid) for cid, _revision, updated in metadata}
+        for entry in progress_meta:
+            candidates[entry['id']] = (entry['running'], entry['observed_at'], entry['id'])
+        selected = {item[2] for item in sorted(candidates.values())[-max_conversations:]}
+        rows = db.execute('''SELECT id,revision,normalized FROM conversations
+            WHERE id IN (SELECT value FROM json_each(?)) ORDER BY source_update,id''',
+            (json.dumps(sorted(selected)),)).fetchall()
         conversations = []
         for cid, revision, encoded in rows:
             data = json.loads(encoded)
@@ -127,14 +142,23 @@ def read_feed(root):
             if data.get('incomplete') or not isinstance(data.get('title'), str):
                 raise ValueError('Invalid or incomplete archived conversation')
             conversations.append(export_conversation(cid, revision, data))
-        from bridge_progress import read_progress
+        progress = read_progress(root, key, selected)
         revisions={cid:revision for cid,revision,_ in rows}
-        for entry in read_progress(root, key):
+        for entry in progress:
+            cid = entry['data']['id']
+            if cid not in revisions:
+                row = db.execute('SELECT revision FROM conversations WHERE id=?', (cid,)).fetchone()
+                if row:
+                    revisions[cid] = row[0]
+        for entry in progress:
             if revisions.get(entry['data']['id'])!=entry.get('base_revision'):continue
             conversations = [c for c in conversations if c["id"] != entry["data"]["id"]]
             item = export_conversation(entry["data"]["id"], entry["revision"], entry["data"])
             item["running"] = entry["running"]
             conversations.append(item)
+        conversations.sort(key=lambda item: (bool(item.get('running')), item['updated_at'], item['id']))
+        conversations = conversations[-max_conversations:]
+        conversations.sort(key=lambda item: (item['updated_at'], item['id']))
         return {
             'version': 1, 'source': 'chatgpt', 'account_key': key,
             'completed_watermark': float(meta['watermark']) if meta.get('watermark') else None,

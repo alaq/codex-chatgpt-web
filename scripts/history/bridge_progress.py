@@ -6,6 +6,7 @@ unfinished turn so a later poll must revisit it before advancing.
 """
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 import stat
 import sqlite3
@@ -28,7 +29,7 @@ def record_progress(root, envelope):
     normalized['messages']=[m for m in normalized['messages'] if m['id'] not in unfinished]
     # These structural fields and source references are not needed for mirroring.
     for field in ('active_nodes','current_node','gizmo_id'):normalized.pop(field,None)
-    with sqlite3.connect((Path(root)/'archive.sqlite3').absolute().as_uri()+'?mode=ro',uri=True) as db:
+    with closing(sqlite3.connect((Path(root)/'archive.sqlite3').absolute().as_uri()+'?mode=ro',uri=True)) as db:
         row=db.execute('SELECT revision FROM conversations WHERE id=?',(normalized['id'],)).fetchone()
     result={'account_key':envelope['accountKey'],'data':normalized,'revision':revision,'base_revision':row[0] if row else None,'observed_at':time.time(),'running':True}
     fd,name=tempfile.mkstemp(prefix='.progress-',dir=directory)
@@ -38,16 +39,28 @@ def record_progress(root, envelope):
     finally:
         Path(name).unlink(missing_ok=True)
 
-def read_progress(root,account):
+def progress_candidates(root, allowed_ids=None):
     directory=Path(root)/'bridge-progress'
     if not directory.exists():return []
     info=directory.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:raise ValueError('Unsafe progress directory')
-    entries=[]
-    for file in sorted(directory.glob('*.json'))[:100]:
+    allowed = set(allowed_ids) if allowed_ids is not None else None
+    files=sorted(directory.glob('*.json'))
+    if allowed is not None:files=[file for file in files if file.stem in allowed]
+    candidates=[]
+    for file in files:
+        cid=file.stem
         info=file.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>32*1024*1024:raise ValueError('Unsafe progress record')
-        entry=json.loads(file.read_text());cid=entry['data']['id']
+        if not UUID.fullmatch(cid):raise ValueError('Progress conversation mismatch')
+        candidates.append({'id':cid,'observed_at':info.st_mtime,'running':time.time()-info.st_mtime<300,'path':file})
+    candidates.sort(key=lambda item:(item['observed_at'],item['id']))
+    return candidates[-100:]
+
+def read_progress(root,account,allowed_ids=None):
+    entries=[]
+    for candidate in progress_candidates(root,allowed_ids):
+        file=candidate['path'];entry=json.loads(file.read_text());cid=entry['data']['id']
         if entry['account_key']!=account or not UUID.fullmatch(cid) or file.stem!=cid:raise ValueError('Progress account or conversation mismatch')
         entry['running']=time.time()-entry['observed_at']<300
         entries.append(entry)

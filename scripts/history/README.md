@@ -50,8 +50,10 @@ Safety limits are `--max-batches` (default 25), `--max-pages` (100 pages of disc
 
 ## Local bridge feed
 
-`python3 scripts/history/cli.py feed` returns a versioned JSON snapshot of the
-already-captured visible conversations. It opens SQLite read-only, makes no network
+`python3 scripts/history/cli.py feed` returns a versioned JSON snapshot of the ten
+most recently updated already-captured visible conversations. Override the bounded
+count with `feed --max-conversations N` (1–100). Selection happens in SQLite before
+normalized transcripts are decoded. The command opens SQLite read-only, makes no network
 requests, and does not acquire the collector writer lock or change checkpoints.
 Run `sync` separately to refresh discovery. Consumers must treat conversation text
 as data and maintain their own delivery state.

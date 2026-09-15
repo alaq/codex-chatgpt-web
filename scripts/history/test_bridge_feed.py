@@ -54,6 +54,86 @@ class BridgeFeedTests(unittest.TestCase):
         self.assertNotIn('mapping', text)
         self.assertNotIn(str(self.root), text)
 
+    def test_feed_exports_only_the_ten_most_recent_conversations(self):
+        for index in range(12):
+            data = conversation()
+            data['conversation_id'] = f'00000000-0000-4000-8000-{index:012d}'
+            data['update_time'] = 1000 + index
+            self.archive.ingest(envelope(data))
+        ids = [item['id'] for item in read_feed(self.root, max_conversations=10)['conversations']]
+        self.assertEqual(ids, [f'00000000-0000-4000-8000-{index:012d}' for index in range(2, 12)])
+
+    def test_allowlist_is_applied_before_the_feed_limit(self):
+        for index in range(12):
+            data = conversation()
+            data['conversation_id'] = f'00000000-0000-4000-8000-{index:012d}'
+            data['update_time'] = 1000 + index
+            self.archive.ingest(envelope(data))
+        allowed = ['00000000-0000-4000-8000-000000000000']
+        ids = [item['id'] for item in read_feed(self.root, 10, allowed)['conversations']]
+        self.assertEqual(ids, allowed)
+
+    def test_progress_limit_is_applied_before_transcript_decode(self):
+        from bridge_progress import record_progress
+        paths = []
+        for index in range(12):
+            data = conversation()
+            cid = f'00000000-0000-4000-8000-{index:012d}'
+            data['conversation_id'] = cid
+            data['update_time'] = 1000 + index
+            self.archive.ingest(envelope(data))
+            data['mapping']['partial'] = node('partial', 'assistant', 'unfinished', 'a')
+            data['mapping']['partial']['message']['status'] = 'in_progress'
+            data['current_node'] = 'partial'
+            record_progress(self.root, envelope(data))
+            path = self.root / 'bridge-progress' / f'{cid}.json'
+            os.utime(path, (1000 + index, 1000 + index))
+            paths.append(path)
+        paths[0].write_text('excluded malformed progress')
+        paths[1].write_text('excluded malformed progress')
+        os.utime(paths[0], (1000, 1000))
+        os.utime(paths[1], (1001, 1001))
+        feed = read_feed(self.root, max_conversations=10)['conversations']
+        self.assertEqual(len(feed), 10)
+
+    def test_progress_allowlist_is_applied_before_transcript_decode(self):
+        from bridge_progress import record_progress
+        allowed = '00000000-0000-4000-8000-000000000000'
+        for index in range(12):
+            data = conversation()
+            cid = f'00000000-0000-4000-8000-{index:012d}'
+            data['conversation_id'] = cid
+            data['update_time'] = 1000 + index
+            self.archive.ingest(envelope(data))
+            data['mapping']['partial'] = node('partial', 'assistant', 'unfinished', 'a')
+            data['mapping']['partial']['message']['status'] = 'in_progress'
+            data['current_node'] = 'partial'
+            record_progress(self.root, envelope(data))
+            if cid != allowed:
+                (self.root / 'bridge-progress' / f'{cid}.json').write_text('excluded malformed progress')
+        feed = read_feed(self.root, 10, [allowed])['conversations']
+        self.assertEqual([item['id'] for item in feed], [allowed])
+
+    def test_running_progress_can_displace_an_older_completed_candidate(self):
+        from bridge_progress import record_progress
+        active = conversation()
+        active['update_time'] = 1
+        self.archive.ingest(envelope(active))
+        for index in range(10):
+            data = conversation()
+            data['conversation_id'] = f'00000000-0000-4000-8000-{index:012d}'
+            data['update_time'] = 1000 + index
+            self.archive.ingest(envelope(data))
+        active['mapping']['partial'] = node('partial', 'assistant', 'unfinished', 'a')
+        active['mapping']['partial']['message']['status'] = 'in_progress'
+        active['current_node'] = 'partial'
+        active['update_time'] = 2
+        record_progress(self.root, envelope(active))
+        feed = read_feed(self.root, max_conversations=10)['conversations']
+        self.assertEqual(len(feed), 10)
+        self.assertIn(ID, [item['id'] for item in feed])
+        self.assertTrue(next(item for item in feed if item['id'] == ID)['running'])
+
     def test_continued_old_chat_keeps_ids_and_adds_visible_turn(self):
         data = conversation()
         self.archive.ingest(envelope(data))
